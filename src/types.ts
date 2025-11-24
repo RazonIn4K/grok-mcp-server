@@ -3,6 +3,15 @@ export interface GrokMessage {
   content: string;
 }
 
+export interface SearchParameters {
+  mode?: 'auto' | 'always' | 'never';
+  return_citations?: boolean;
+  sources?: Array<'web' | 'news' | 'x' | 'rss'>;
+  from_date?: string;
+  to_date?: string;
+  included_x_handles?: string[];
+}
+
 export interface GrokChatRequest {
   model: string;
   messages: GrokMessage[];
@@ -11,6 +20,7 @@ export interface GrokChatRequest {
   stream?: boolean;
   functions?: GrokFunction[];
   function_call?: string | { name: string };
+  search_parameters?: SearchParameters;
 }
 
 export interface GrokChatResponse {
@@ -27,6 +37,7 @@ export interface GrokChatResponse {
         name: string;
         arguments: string;
       };
+      citations?: string[];
     };
     finish_reason: string;
   }>;

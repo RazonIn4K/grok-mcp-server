@@ -76,7 +76,7 @@ for (const envVar of requiredEnvVars) {
 const grokConfig: GrokConfig = {
   apiKey: process.env.XAI_API_KEY!,
   baseUrl: process.env.XAI_BASE_URL || 'https://api.x.ai/v1',
-  model: process.env.GROK_MODEL || 'grok-4-1-fast-reasoning',
+  model: process.env.GROK_MODEL || 'grok-4.1-fast',
   temperature: parseFloat(process.env.GROK_TEMPERATURE || '0.7'),
   maxTokens: parseInt(process.env.GROK_MAX_TOKENS || '4000'),
 };

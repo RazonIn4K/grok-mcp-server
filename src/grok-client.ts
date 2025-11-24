@@ -1,10 +1,11 @@
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
-import { 
-  GrokChatRequest, 
-  GrokChatResponse, 
-  GrokSearchRequest, 
+import {
+  GrokChatRequest,
+  GrokChatResponse,
+  GrokSearchRequest,
   GrokSearchResponse,
-  GrokConfig 
+  GrokConfig,
+  SearchParameters
 } from './types.js';
 import { ExternalServiceError } from './errors.js';
 import { LRUCache } from 'lru-cache';
@@ -79,7 +80,8 @@ export class GrokClient {
   }
 
   /**
-   * Perform a live search using Grok's search capabilities
+   * Perform live search using Grok's integrated agentic search in chat completions
+   * This uses the new search_parameters in the chat endpoint (post-Nov 2025 migration)
    */
   async liveSearch(request: GrokSearchRequest): Promise<GrokSearchResponse> {
     const cacheKey = JSON.stringify({ type: 'search', ...request });
@@ -88,97 +90,127 @@ export class GrokClient {
       logger.info({ cacheKey }, 'Cache hit for liveSearch');
       return cached;
     }
+
     try {
-      const response: AxiosResponse<GrokSearchResponse> = await this.limiter.schedule(() =>
-        this.client.post('/search', request)
-      );
-      this.cache.set(cacheKey, response.data);
-      return response.data;
+      // Convert search request to chat completion with search_parameters
+      const chatResponse = await this.chatCompletion({
+        messages: [
+          {
+            role: 'user',
+            content: `Search for: ${request.query}`
+          }
+        ],
+        search_parameters: {
+          mode: 'always',
+          return_citations: true,
+          sources: request.include_news ? ['web', 'news'] : ['web'],
+          from_date: request.time_filter === 'day' ? this.getDateOffset(1) :
+                     request.time_filter === 'week' ? this.getDateOffset(7) :
+                     request.time_filter === 'month' ? this.getDateOffset(30) :
+                     request.time_filter === 'year' ? this.getDateOffset(365) : undefined,
+        },
+        temperature: 0.3, // Lower temperature for more focused search results
+        max_tokens: 2000,
+      });
+
+      const message = chatResponse.choices[0]?.message;
+      const content = message?.content || '';
+      const citations = message?.citations || [];
+
+      // Parse the response to extract search results
+      const results = this.parseSearchResults(content, citations, request.max_results);
+
+      const response: GrokSearchResponse = {
+        results,
+        total_results: results.length,
+        search_time: 0.5,
+      };
+
+      this.cache.set(cacheKey, response);
+      return response;
     } catch (error) {
       logger.error({ err: error }, 'Grok API liveSearch error');
-      if (axios.isAxiosError(error)) {
-        // Fallback: if live search is not available (404 or other errors), simulate it with chat completion
-        logger.warn('Live search endpoint not available, using chat completion with search context');
-        return this.simulateSearch(request);
-      }
-      throw error;
+      throw new ExternalServiceError(
+        'Live search failed',
+        500,
+        { cause: error }
+      );
     }
   }
 
   /**
-   * Simulate search using chat completion when live search is unavailable
+   * Helper to get date offset in YYYY-MM-DD format
    */
-  private async simulateSearch(request: GrokSearchRequest): Promise<GrokSearchResponse> {
-    const searchPrompt = `I need you to simulate web search results for the query: "${request.query}"
+  private getDateOffset(daysAgo: number): string {
+    const date = new Date();
+    date.setDate(date.getDate() - daysAgo);
+    return date.toISOString().split('T')[0];
+  }
 
-Please provide ${request.max_results || 5} realistic search results that someone would find when searching for this topic online.
+  /**
+   * Parse search results from chat response and citations
+   */
+  private parseSearchResults(
+    content: string,
+    citations: string[],
+    maxResults?: number
+  ): Array<{ title: string; url: string; snippet: string; published_date?: string; source?: string }> {
+    const results = [];
+    const limit = maxResults || 10;
 
-Respond with ONLY valid JSON in this exact format:
-{
-  "results": [
-    {
-      "title": "Title of the webpage",
-      "url": "https://example.com/page",
-      "snippet": "Brief description of what this page contains",
-      "published_date": "2024-01-01" (optional)
-    }
-  ]
-}
-
-Make sure:
-- URLs are realistic and related to the topic
-- Snippets are informative and relevant
-- No extra text outside the JSON
-- Each result has title, url, and snippet`;
-
-    const chatResponse = await this.chatCompletion({
-      messages: [
-        { role: 'system', content: 'You are a search results generator. Respond ONLY with valid JSON. Do not include any explanation or additional text.' },
-        { role: 'user', content: searchPrompt }
-      ],
-      temperature: 0.1, // Lower temperature for more consistent JSON
-      max_tokens: 2000,
-    });
-
-    try {
-      let content = chatResponse.choices[0]?.message?.content || '{"results": []}';
-      
-      // Clean up the content to extract JSON
-      content = content.trim();
-      
-      // Remove markdown code blocks if present
-      content = content.replace(/```json\n?|```\n?/g, '');
-      
-      // Try to find JSON in the response
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        content = jsonMatch[0];
+    // If we have citations, create results from them
+    if (citations && citations.length > 0) {
+      for (const url of citations.slice(0, limit)) {
+        results.push({
+          title: this.extractTitleFromUrl(url),
+          url,
+          snippet: content.substring(0, 200), // Use first part of response as snippet
+          source: new URL(url).hostname,
+        });
       }
-      
-      const parsed = JSON.parse(content);
-      
-      return {
-        results: parsed.results || [],
-        total_results: parsed.results?.length || 0,
-        search_time: 0.5,
-      };
-    } catch (parseError) {
-      logger.error({ err: parseError, content: chatResponse.choices[0]?.message?.content }, 'Failed to parse search results');
-      
-      // Return fallback results based on the query
-      const fallbackResults = [
-        {
-          title: `Search results for: ${request.query}`,
-          url: `https://www.google.com/search?q=${encodeURIComponent(request.query)}`,
-          snippet: `Information about ${request.query} - simulated search result as the live search API is not available.`,
+    }
+
+    // If we don't have enough results from citations, try to parse from content
+    if (results.length < limit) {
+      // Look for structured data in the response (URLs, links, etc)
+      const urlPattern = /https?:\/\/[^\s]+/g;
+      const foundUrls = content.match(urlPattern) || [];
+
+      for (const url of foundUrls.slice(0, limit - results.length)) {
+        if (!citations.includes(url)) {
+          results.push({
+            title: this.extractTitleFromUrl(url),
+            url,
+            snippet: content.substring(0, 200),
+            source: new URL(url).hostname,
+          });
         }
-      ];
-      
-      return {
-        results: fallbackResults,
-        total_results: fallbackResults.length,
-        search_time: 0.5,
-      };
+      }
+    }
+
+    // If still no results, create a generic result from the content
+    if (results.length === 0) {
+      results.push({
+        title: 'Search Result',
+        url: 'https://grok.com',
+        snippet: content.substring(0, 300),
+        source: 'grok',
+      });
+    }
+
+    return results;
+  }
+
+  /**
+   * Helper to extract a title from a URL
+   */
+  private extractTitleFromUrl(url: string): string {
+    try {
+      const urlObj = new URL(url);
+      const path = urlObj.pathname.split('/').filter(Boolean).pop() || urlObj.hostname;
+      return path.replace(/[-_]/g, ' ').substring(0, 100);
+    } catch {
+      return 'Search Result';
     }
   }
 
@@ -211,31 +243,24 @@ Make sure:
       messages.push({ role: 'user' as const, content: question });
     }
 
-    // If search is requested, add recent information
-    if (options?.includeSearch) {
-      try {
-        const searchResults = await this.liveSearch({ query: question, max_results: 3 });
-        if (searchResults.results.length > 0) {
-          const searchContext = searchResults.results
-            .map(result => `Title: ${result.title}\nURL: ${result.url}\nSnippet: ${result.snippet}`)
-            .join('\n\n');
-          
-          messages.push({
-            role: 'system' as const,
-            content: `Recent search results for context:\n\n${searchContext}`
-          });
-        }
-      } catch (searchError) {
-        logger.warn({ err: searchError }, 'Search failed, proceeding without search context');
-      }
-    }
-
-    const response = await this.chatCompletion({
+    // Build chat completion request
+    const chatRequest: Partial<GrokChatRequest> = {
       messages,
       model: options?.model,
       temperature: options?.temperature,
       max_tokens: options?.maxTokens,
-    });
+    };
+
+    // If search is requested, add search parameters to the request
+    if (options?.includeSearch) {
+      chatRequest.search_parameters = {
+        mode: 'always',
+        return_citations: true,
+        sources: ['web', 'news'],
+      };
+    }
+
+    const response = await this.chatCompletion(chatRequest);
 
     return response.choices[0]?.message?.content || 'No response generated';
   }
@@ -262,10 +287,10 @@ Make sure:
   async getModels(): Promise<string[]> {
     try {
       const response = await this.client.get('/models');
-      return response.data.data?.map((model: any) => model.id) || ['grok-4'];
+      return response.data.data?.map((model: any) => model.id) || ['grok-4.1-fast'];
     } catch (error) {
       logger.warn({ err: error }, 'Models endpoint not available, using default models');
-      return ['grok-4-1-fast-reasoning', 'grok-4-1-fast-non-reasoning', 'grok-code-fast-1', 'grok-4', 'grok-3'];
+      return ['grok-4.1-fast', 'grok-4-1-fast-reasoning', 'grok-4-1-fast-non-reasoning', 'grok-code-fast-1', 'grok-4'];
     }
   }
 }
