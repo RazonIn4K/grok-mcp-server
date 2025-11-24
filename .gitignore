@@ -146,6 +146,9 @@ secrets.json
 mcp-config.json
 mcp-server-config.json
 
+# Shell scripts with secrets (commented out since they should be removed entirely)
+# grok-mcp-server.sh
+
 # Testing
 test-results/
 playwright-report/
