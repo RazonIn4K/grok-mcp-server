@@ -146,8 +146,10 @@ secrets.json
 mcp-config.json
 mcp-server-config.json
 
-# Shell scripts with secrets (commented out since they should be removed entirely)
-# grok-mcp-server.sh
+# Shell scripts with environment/secrets
+grok-mcp-server.sh
+run-with-env.sh
+*.sh.local
 
 # Testing
 test-results/
