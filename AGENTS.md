@@ -1,10 +1,10 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-This is a Model Context Protocol (MCP) server that integrates xAI's Grok 4.5 AI model with Claude Code and other MCP-compatible applications. The server provides tools for chat completion, live search, and function calling capabilities.
+This is a Model Context Protocol (MCP) server that integrates xAI's Grok 4.5 AI model with Codex and other MCP-compatible applications. The server provides tools for chat completion, live search, and function calling capabilities.
 
 ## Development Commands
 

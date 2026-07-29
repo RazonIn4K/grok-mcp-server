@@ -5,7 +5,7 @@ echo "📊 Grok MCP Server Status Check"
 echo "==============================="
 echo ""
 
-cd /Users/davidortiz/MCP-Servers/grok-4-mcp-server
+cd "$(cd "$(dirname "$0")" && pwd)" 2>/dev/null || cd .
 
 # 1. Directory and files
 echo "📁 Files and Directories:"
@@ -30,10 +30,17 @@ echo "   node_modules: $([ -d node_modules ] && echo "EXISTS" || echo "MISSING")
 echo ""
 echo "🌍 Environment:"
 source ~/.zshrc 2>/dev/null
-if [ -n "$X_AI_API_KEY" ]; then
-    echo "   X_AI_API_KEY: FOUND (${X_AI_API_KEY:0:10}...)"
+if [ -n "$XAI_API_KEY" ] || [ -n "$X_AI_API_KEY" ]; then
+    ACTIVE_KEY="${XAI_API_KEY:-$X_AI_API_KEY}"
+    echo "   XAI_API_KEY: FOUND (${ACTIVE_KEY:0:10}...)"
 else
-    echo "   X_AI_API_KEY: NOT FOUND"
+    echo "   XAI_API_KEY: NOT FOUND"
+fi
+
+if [ -n "$SHARED_SECRET" ]; then
+    echo "   SHARED_SECRET: FOUND"
+else
+    echo "   SHARED_SECRET: NOT FOUND"
 fi
 
 # 5. Node.js
@@ -60,7 +67,7 @@ fi
 echo ""
 echo "🎯 Quick Fix Commands:"
 echo "   Make executable: chmod +x *.sh"
-echo "   Install deps: npm install" 
+echo "   Install deps: npm install"
 echo "   Build project: npm run build"
 echo "   Allow direnv: direnv allow ."
 echo "   Run diagnosis: ./diagnose-and-fix.sh"

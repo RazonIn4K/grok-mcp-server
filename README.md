@@ -1,12 +1,12 @@
-# Grok 4 MCP Server
+# Grok 4.5 MCP Server
 
-A Model Context Protocol (MCP) server that provides AI assistants with access to Grok 4's capabilities including chat completions, live search, and model management.
+A Model Context Protocol (MCP) server that provides AI assistants with access to Grok 4.5 capabilities including chat completions, web search (via Responses API), and model management.
 
 ## Features
 
-- **Chat Completions**: Interact with Grok 4 for conversational AI tasks
-- **Live Search**: Real-time web search with structured results
-- **Multi-Model Support**: Supports grok-4-1-fast-reasoning, grok-4-1-fast-non-reasoning, and grok-code-fast-1
+- **Chat Completions**: Interact with Grok 4.5 for conversational AI tasks
+- **Web Search**: Real-time web (and X) search with Responses API `web_search` / `x_search` tools, modern options (image understanding/search), plus legacy `search_parameters` compatibility for the `grok_search` tool
+- **Multi-Model Support**: Defaults to Grok 4.5 and supports Grok 4.3/grok-latest legacy aliases, Grok Build 0.1, and Grok Imagine/Voice APIs
 - **Rate Limiting**: Built-in request throttling and circuit breaker patterns
 - **Caching**: Intelligent response caching for improved performance
 - **Metrics**: Prometheus metrics for monitoring and observability
@@ -14,11 +14,16 @@ A Model Context Protocol (MCP) server that provides AI assistants with access to
 
 ## Supported Models
 
-| Model | Context Window | TPM | RPM | Input Price | Output Price | Use Case |
-|-------|---------------:|----:|----:|------------:|-------------:|----------|
-| grok-4-1-fast-reasoning | 2,000,000 | 4M | 480 | $0.20/M tokens | $0.50/M tokens | General reasoning tasks |
-| grok-4-1-fast-non-reasoning | 2,000,000 | 4M | 480 | $0.20/M tokens | $0.50/M tokens | Fast, direct responses |
-| grok-code-fast-1 | N/A | N/A | N/A | N/A | N/A | Code generation and analysis |
+| Model | Context Window | Tier 0 TPM | Tier 0 RPS | Input Price | Output Price | Use Case |
+|-------|---------------:|-----------:|-----------:|------------:|-------------:|----------|
+| grok-4.5 | 500,000 | 50M | 150 | $2.00/M | $6.00/M | Default for code, chat, reasoning, and tool use |
+| grok-4.5-latest | 500,000 | 50M | 150 | $2.00/M | $6.00/M | Latest Grok 4.5 alias |
+| grok-4.3 | 1,000,000 | 10M | 37 | $1.25/M | $2.50/M | Legacy redirect target for retired text slugs |
+| grok-latest | 1,000,000 | 10M | 37 | $1.25/M | $2.50/M | Legacy alias for Grok 4.3 |
+| grok-4.20 | 1,000,000 | 10M | 37 | N/A | N/A | Legacy reasoning and general chat |
+| grok-build-0.1 | 256K | 10M | 37 | $1.00/M | $2.00/M | Code generation and agentic workflows |
+| grok-imagine-image | N/A | N/A | N/A | N/A | N/A | Image generation |
+| grok-voice-think-fast-1.0 | N/A | N/A | N/A | N/A | N/A | Voice workflows |
 
 ## Installation
 
@@ -49,8 +54,9 @@ cp .env.example .envrc
 Edit `.envrc` with your configuration:
 ```bash
 export XAI_API_KEY="your-xai-api-key-here"
-export GROK_MODEL="grok-4-1-fast-reasoning"  # or grok-4-1-fast-non-reasoning, grok-code-fast-1
-export GROK_BASE_URL="https://api.x.ai/v1"  # Optional, defaults provided
+export SHARED_SECRET="your-shared-secret-here"
+export GROK_MODEL="grok-4.5"
+export GROK_BASE_URL="https://api.x.ai/v1"  # Optional; accepts https://api.x.ai and appends /v1 (XAI_BASE_URL also accepted)
 export GROK_TEMPERATURE="0.7"              # Optional, 0.0-1.0
 export GROK_MAX_TOKENS="4000"              # Optional
 export MCP_SERVER_NAME="grok-4-mcp-server" # Optional
@@ -87,9 +93,11 @@ npm run dev
 
 The server implements the Model Context Protocol and can be integrated with any MCP-compatible client. It exposes the following tools:
 
-- `grok_ask`: Ask Grok a question with optional context and search
+- `grok_ask`: Ask Grok a question with optional context and web search context
 - `grok_chat`: Multi-turn conversations with Grok
-- `grok_search`: Live web search functionality
+- `grok_search`: Web (and optional X) search powered by Responses API `web_search`/`x_search` tools, with image understanding/search support and legacy compat
+- `grok_x_search`: Dedicated X/Twitter search via the x_search tool
+- `grok_ask` / `grok_chat`: Support `include_search` + modern flags for injecting search context (with images/X)
 - `grok_models`: List available Grok models
 - `grok_test_connection`: Test API connectivity
 - `grok_health`: Server health check and metrics
@@ -103,7 +111,8 @@ The server implements the Model Context Protocol and can be integrated with any 
       "command": "node",
       "args": ["dist/index.js"],
       "env": {
-        "XAI_API_KEY": "your-key-here"
+        "XAI_API_KEY": "your-key-here",
+        "SHARED_SECRET": "your-shared-secret-here"
       }
     }
   }
@@ -117,21 +126,29 @@ The server implements the Model Context Protocol and can be integrated with any 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XAI_API_KEY` | *Required* | Your xAI API key |
-| `GROK_MODEL` | `grok-4-1-fast-reasoning` | Default model to use |
-| `GROK_BASE_URL` | `https://api.x.ai/v1` | API endpoint URL |
+| `SHARED_SECRET` | *Required* | Shared secret used to authenticate MCP requests |
+| `GROK_MODEL` | `grok-4.5` | Default model to use |
+| `GROK_BASE_URL` | `https://api.x.ai/v1` | API endpoint URL (accepts `https://api.x.ai` and appends `/v1`; `XAI_BASE_URL` also accepted) |
 | `GROK_TEMPERATURE` | `0.7` | Response creativity (0.0-1.0) |
 | `GROK_MAX_TOKENS` | `4000` | Maximum response tokens |
 | `LOG_LEVEL` | `info` | Logging verbosity |
 | `NODE_ENV` | `production` | Environment mode |
+| `GROK_TIMEOUT_MS` | `60000` | Request timeout for chat completions (milliseconds) |
+| `GROK_SEARCH_TIMEOUT_MS` | `120000` | Request timeout for live search / Responses API calls (milliseconds) |
+| `GROK_RETRIES` | `2` | Number of retries for transient failures (network errors, 5xx, 429) |
+| `GROK_RETRY_DELAY_MS` | `1000` | Base delay between retries; doubles with each attempt (milliseconds) |
+| `GROK_MAX_CONCURRENT` | `2` | Maximum concurrent requests to the xAI API |
+| `GROK_MIN_TIME_MS` | `500` | Minimum interval between requests to the xAI API (milliseconds) |
 
 ### Advanced Configuration
 
 The server includes built-in resilience features:
 
-- **Rate Limiting**: 2 concurrent requests, 500ms minimum interval
-- **Circuit Breaker**: Automatic failure handling with fallback
-- **Caching**: 5-minute TTL LRU cache for responses
-- **Connection Pooling**: HTTP agent with keep-alive connections
+- **Configurable Timeouts**: Separate timeouts for chat and search/Responses API calls.
+- **Retries with Backoff**: Transient failures (network errors, 5xx, 429) are retried up to `GROK_RETRIES` times with exponential backoff.
+- **Rate Limiting**: Configurable concurrency and minimum interval (`GROK_MAX_CONCURRENT`, `GROK_MIN_TIME_MS`).
+- **Caching**: 5-minute TTL LRU cache for responses.
+- **Connection Pooling**: HTTP agent with keep-alive connections.
 
 ## Development
 
@@ -184,9 +201,9 @@ The server exposes Prometheus metrics at `/metrics` (when health endpoint is cal
 ### Common Issues
 
 1. **"API key not found"**: Ensure `XAI_API_KEY` is set in your environment
-2. **"Connection timeout"**: Check network connectivity and API endpoint URL
+2. **"Connection timeout" / request timeouts**: Increase `GROK_TIMEOUT_MS` (default 60s) for long reasoning requests and `GROK_SEARCH_TIMEOUT_MS` (default 120s) for live search. Also check network connectivity and the API endpoint URL.
 3. **"Rate limit exceeded"**: Implement client-side rate limiting or increase intervals
-4. **"Model not available"**: Verify the model name is correct and supported
+4. **"Model not available"**: Verify the model name is correct and supported; retired slugs now alias to current models
 
 ### Debug Mode
 
@@ -234,6 +251,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ### v1.0.0
 - Initial release with Grok 4 support
+- Updated default model to Grok 4.5
 - MCP protocol implementation
 - Multi-model support
 - Comprehensive error handling and monitoring

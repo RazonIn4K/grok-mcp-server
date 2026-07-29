@@ -1,16 +1,16 @@
 #!/bin/bash
 
-# Grok 4 MCP Server Setup Script
+# Grok 4.5 MCP Server Setup Script
 # This script will install dependencies, build the server, and help configure Claude Code integration
 
-echo "🚀 Setting up Grok 4 MCP Server for Claude Code Integration"
+echo "🚀 Setting up Grok 4.5 MCP Server for Claude Code Integration"
 echo "============================================================"
 echo ""
 
 # Check if we're in the right directory
 if [ ! -f "package.json" ]; then
     echo "❌ Error: Please run this script from the grok-4-mcp-server directory"
-    echo "   cd /Users/davidortiz/MCP-Servers/grok-4-mcp-server"
+    echo "   (cd to the directory containing this setup-grok.sh and run ./setup-grok.sh)"
     exit 1
 fi
 
@@ -58,8 +58,9 @@ echo "🔧 Checking environment configuration..."
 if [ ! -f ".env" ]; then
     echo "⚠️  No .env file found. Creating from template..."
     cp .env.example .env
-    echo "📝 Please edit .env file and add your xAI API key:"
+    echo "📝 Please edit .env file and add your xAI API key and shared secret:"
     echo "   XAI_API_KEY=xai-your-actual-api-key-here"
+    echo "   SHARED_SECRET=your-shared-secret-here"
     echo ""
     echo "🔑 To get your API key:"
     echo "   1. Visit https://console.x.ai"
@@ -72,10 +73,10 @@ else
     echo "✅ .env file exists"
 fi
 
-# Test API connection (if API key is provided)
+# Test API connection (if API key and shared secret are provided)
 echo ""
 echo "🧪 Testing API connection..."
-if grep -q "xai-.*" .env 2>/dev/null; then
+if grep -q "xai-.*" .env 2>/dev/null && grep -q "^SHARED_SECRET=" .env 2>/dev/null; then
     echo "Testing Grok API connection..."
     npm start &
     SERVER_PID=$!
@@ -83,8 +84,8 @@ if grep -q "xai-.*" .env 2>/dev/null; then
     kill $SERVER_PID 2>/dev/null
     echo "✅ Server startup test completed"
 else
-    echo "⚠️  API key not found in .env file. Skipping connection test."
-    echo "   Please add your xAI API key to test the connection."
+    echo "⚠️  API key or shared secret not found in .env file. Skipping connection test."
+    echo "   Please add XAI_API_KEY and SHARED_SECRET to test the connection."
 fi
 
 # Claude Code MCP configuration
@@ -108,14 +109,16 @@ echo "Configuration file: $MCP_CONFIG_PATH"
 echo ""
 echo "Add this JSON configuration:"
 echo ""
-cat << 'EOF'
+PROJECT_DIR_HERE="$(pwd)"
+cat << EOF
 {
   "mcpServers": {
-    "grok-4": {
+    "grok": {
       "command": "node",
-      "args": ["/Users/davidortiz/MCP-Servers/grok-4-mcp-server/dist/index.js"],
+      "args": ["$PROJECT_DIR_HERE/dist/index.js"],
       "env": {
-        "XAI_API_KEY": "xai-your-actual-api-key-here"
+        "XAI_API_KEY": "xai-your-actual-api-key-here",
+        "SHARED_SECRET": "your-shared-secret-here"
       }
     }
   }
@@ -131,11 +134,17 @@ echo "📝 Creating MCP configuration helper..."
 cat << 'EOF' > update-mcp-config.sh
 #!/bin/bash
 
-# Get API key from .env file
+# Get API key and shared secret from .env file
 API_KEY=$(grep XAI_API_KEY .env | cut -d'=' -f2)
+SHARED_SECRET=$(grep SHARED_SECRET .env | cut -d'=' -f2)
 
 if [ -z "$API_KEY" ]; then
     echo "❌ No API key found in .env file"
+    exit 1
+fi
+
+if [ -z "$SHARED_SECRET" ]; then
+    echo "❌ No SHARED_SECRET found in .env file"
     exit 1
 fi
 
@@ -149,11 +158,12 @@ mkdir -p "$MCP_CONFIG_DIR"
 cat > "$MCP_CONFIG_FILE" << EOL
 {
   "mcpServers": {
-    "grok-4": {
+    "grok": {
       "command": "node",
       "args": ["$(pwd)/dist/index.js"],
       "env": {
-        "XAI_API_KEY": "$API_KEY"
+        "XAI_API_KEY": "$API_KEY",
+        "SHARED_SECRET": "$SHARED_SECRET"
       }
     }
   }

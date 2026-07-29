@@ -7,8 +7,9 @@ echo "🔍 Grok MCP Server Diagnostic and Fix Tool"
 echo "==========================================="
 echo ""
 
-# Change to the correct directory
-cd /Users/davidortiz/MCP-Servers/grok-4-mcp-server
+# Change to the script's directory (portable)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 # Check if we're in the right place
 if [ ! -f "package.json" ]; then
@@ -87,15 +88,26 @@ echo "✅ TypeScript compilation up to date"
 echo ""
 echo "🔐 Checking environment configuration..."
 
-# Check if X_AI_API_KEY is available in shell
+# Check if XAI_API_KEY is available in shell
 source ~/.zshrc 2>/dev/null
-if [ -z "$X_AI_API_KEY" ]; then
-    echo "❌ X_AI_API_KEY not found in shell environment"
-    echo "   Please add to ~/.zshrc: export X_AI_API_KEY='xai-your-api-key'"
+if [ -z "$XAI_API_KEY" ] && [ -z "$X_AI_API_KEY" ]; then
+    echo "❌ XAI_API_KEY not found in shell environment"
+    echo "   Please add to ~/.zshrc: export XAI_API_KEY='xai-your-api-key'"
+    echo "   (or export X_AI_API_KEY='xai-your-api-key')"
     exit 1
 fi
 
-echo "✅ X_AI_API_KEY found in environment (${X_AI_API_KEY:0:10}...)"
+ACTIVE_KEY="${XAI_API_KEY:-$X_AI_API_KEY}"
+echo "✅ XAI_API_KEY found in environment (${ACTIVE_KEY:0:10}...)"
+
+# Check SHARED_SECRET availability
+if [ -z "$SHARED_SECRET" ]; then
+    echo "❌ SHARED_SECRET not found in shell environment"
+    echo "   Please add to ~/.zshrc: export SHARED_SECRET='your-shared-secret'"
+    exit 1
+fi
+
+echo "✅ SHARED_SECRET found in environment"
 
 # 6. Check direnv setup
 echo ""
@@ -130,7 +142,7 @@ if kill -0 $SERVER_PID 2>/dev/null; then
     kill $SERVER_PID 2>/dev/null
 else
     echo "❌ Server failed to start or exited early"
-    echo "   Check if XAI_API_KEY is valid"
+    echo "   Check if XAI_API_KEY and SHARED_SECRET are valid"
 fi
 
 # 8. Update MCP configuration
@@ -152,6 +164,7 @@ echo "2. Test with grok_test_connection tool"
 echo "3. Use grok_ask, grok_search, or grok_chat tools"
 echo ""
 echo "If you still have issues:"
-echo "- Check that your X_AI_API_KEY is valid"
+echo "- Check that your XAI_API_KEY is valid"
+echo "- Check that your SHARED_SECRET is set"
 echo "- Ensure Claude Code can access the server path"
 echo "- Check Claude Code logs for error details"

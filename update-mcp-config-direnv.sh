@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Update MCP configuration for Claude Code with direnv support
-# This script configures Claude Code to use the Grok 4 MCP server with your shell environment
+# This script configures Claude Code to use the Grok 4.5 MCP server with your shell environment
 
-echo "🔧 Updating Claude Code MCP configuration for Grok 4 with direnv..."
+echo "🔧 Updating Claude Code MCP configuration for Grok 4.5 with direnv..."
 
 MCP_CONFIG_DIR="$HOME/.config/claude-code"
 MCP_CONFIG_FILE="$MCP_CONFIG_DIR/mcp.json"
@@ -20,12 +20,13 @@ if [ -f "$MCP_CONFIG_FILE" ] && [ -s "$MCP_CONFIG_FILE" ]; then
 fi
 
 # Create MCP configuration that uses direnv
-cat > "$MCP_CONFIG_FILE" << 'EOL'
+SCRIPT_DIR_HERE="$(cd "$(dirname "$0")" && pwd)"
+cat > "$MCP_CONFIG_FILE" << EOL
 {
   "mcpServers": {
-    "grok-4": {
+    "grok": {
       "command": "bash",
-      "args": ["-c", "cd /Users/davidortiz/MCP-Servers/grok-4-mcp-server && direnv exec . node dist/index.js"],
+      "args": ["-c", "cd \"$SCRIPT_DIR_HERE\" && direnv exec . node dist/index.js"],
       "env": {}
     }
   }
@@ -36,7 +37,7 @@ echo "✅ Updated Claude Code MCP configuration: $MCP_CONFIG_FILE"
 echo ""
 echo "📝 Configuration Details:"
 echo "   - Uses direnv to load environment from .envrc"
-echo "   - Automatically picks up X_AI_API_KEY from your shell"
+echo "   - Automatically picks up XAI_API_KEY (or X_AI_API_KEY) and SHARED_SECRET from .envrc"
 echo "   - No hardcoded API keys in configuration"
 echo ""
 echo "🎯 Next Steps:"
