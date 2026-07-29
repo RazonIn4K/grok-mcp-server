@@ -44,6 +44,7 @@ export interface GrokChatResponse {
         name: string;
         arguments: string;
       };
+      citations?: string[];
     };
     finish_reason: string;
   }>;
@@ -70,7 +71,7 @@ export interface GrokSearchRequest {
   include_news?: boolean;
   time_filter?: "day" | "week" | "month" | "year" | "all";
   search_parameters?: GrokSearchParameters;
-  // Modern Responses API web_search / x_search tool options (preferred over legacy)
+  // Modern Responses API web_search / x_search tool options (preferred over legacy chat search_parameters)
   enable_image_understanding?: boolean;
   enable_image_search?: boolean;
   include_x_search?: boolean; // include x_search tool alongside or instead of web
