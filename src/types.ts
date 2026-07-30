@@ -88,6 +88,7 @@ export interface GrokSearchResponse {
   }>;
   total_results: number;
   search_time: number;
+  degraded?: boolean;
 }
 
 export interface GrokConfig {
@@ -100,8 +101,11 @@ export interface GrokConfig {
   perplexityModel?: string;
   // Timeout / retry configuration
   timeoutMs?: number;
+  askOverallTimeoutMs?: number;
   searchTimeoutMs?: number;
+  searchOverallTimeoutMs?: number;
   retries?: number;
+  searchRetries?: number;
   retryDelayMs?: number;
   maxConcurrent?: number;
   minTimeMs?: number;

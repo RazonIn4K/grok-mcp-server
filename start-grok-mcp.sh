@@ -5,10 +5,13 @@
 #
 # Priority order for secrets:
 #   1. Environment variables (from MCP client config)
-#   2. Doppler (local-mac-work/dev project)
-#   3. Shell config (~/.zshrc)
-#   4. .env file
-#   5. .envrc file
+#   2. Local .env file
+#   3. Local .envrc file
+#   4. Doppler (local-mac-work/dev project)
+#   5. Shell config (~/.zshrc)
+#
+# Local sources are checked before network-backed Doppler so MCP startup is
+# deterministic when the repository already has its credentials configured.
 
 set -e
 
@@ -33,8 +36,24 @@ if [ -n "$XAI_API_KEY" ]; then
 elif [ -n "$X_AI_API_KEY" ]; then
     export XAI_API_KEY="$X_AI_API_KEY"
 
-# 3. Try Doppler FIRST (preferred method for secrets management)
-elif command -v doppler >/dev/null 2>&1; then
+# 3. Try .env file in project directory
+elif [ -f ".env" ]; then
+    ENV_KEY=$(grep -E '^XAI_API_KEY=' .env 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    if [ -n "$ENV_KEY" ]; then
+        export XAI_API_KEY="$ENV_KEY"
+    fi
+fi
+
+# 4. Try .envrc file
+if [ -z "$XAI_API_KEY" ] && [ -f ".envrc" ]; then
+    ENVRC_KEY=$(grep -E '^[[:space:]]*(export[[:space:]]+)?XAI_API_KEY=' .envrc 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    if [ -n "$ENVRC_KEY" ]; then
+        export XAI_API_KEY="$ENVRC_KEY"
+    fi
+fi
+
+# 5. Try Doppler when no local source is available
+if [ -z "$XAI_API_KEY" ] && command -v doppler >/dev/null 2>&1; then
     DOPPLER_KEY=$(doppler secrets get XAI_API_KEY --project "$DOPPLER_PROJECT" --config "$DOPPLER_CONFIG" --plain 2>/dev/null || true)
     if [ -n "$DOPPLER_KEY" ] && echo "$DOPPLER_KEY" | grep -q '^xai-'; then
         export XAI_API_KEY="$DOPPLER_KEY"
@@ -44,9 +63,10 @@ elif command -v doppler >/dev/null 2>&1; then
             export SHARED_SECRET="$DOPPLER_SECRET"
         fi
     fi
+fi
 
-# 4. Try to source zsh config to get the key
-elif [ -f "$HOME/.zshrc" ]; then
+# 6. Try to read an exported key from zsh config
+if [ -z "$XAI_API_KEY" ] && [ -f "$HOME/.zshrc" ]; then
     # Extract just the API key export lines without running the full zshrc
     X_AI_KEY=$(grep -E '^export X_AI_API_KEY=' "$HOME/.zshrc" 2>/dev/null | tail -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'" | tr -d ' ')
     XAI_KEY=$(grep -E '^export XAI_API_KEY=' "$HOME/.zshrc" 2>/dev/null | tail -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'" | tr -d ' ')
@@ -55,22 +75,6 @@ elif [ -f "$HOME/.zshrc" ]; then
         export XAI_API_KEY="$XAI_KEY"
     elif [ -n "$X_AI_KEY" ]; then
         export XAI_API_KEY="$X_AI_KEY"
-    fi
-fi
-
-# 5. Try .env file in project directory (fallback)
-if [ -z "$XAI_API_KEY" ] && [ -f ".env" ]; then
-    ENV_KEY=$(grep -E '^XAI_API_KEY=' .env 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
-    if [ -n "$ENV_KEY" ]; then
-        export XAI_API_KEY="$ENV_KEY"
-    fi
-fi
-
-# 6. Try .envrc file (fallback)
-if [ -z "$XAI_API_KEY" ] && [ -f ".envrc" ]; then
-    ENVRC_KEY=$(grep -E '^export XAI_API_KEY=' .envrc 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
-    if [ -n "$ENVRC_KEY" ]; then
-        export XAI_API_KEY="$ENVRC_KEY"
     fi
 fi
 
@@ -96,7 +100,7 @@ fi
 
 # Check for placeholder values
 if echo "$XAI_API_KEY" | grep -qiE 'your.*key|placeholder|example|xxxx'; then
-    echo "ERROR: XAI_API_KEY appears to be a placeholder value: ${XAI_API_KEY:0:20}..." >&2
+    echo "ERROR: XAI_API_KEY appears to be a placeholder value." >&2
     echo "Please set a real xAI API key." >&2
     exit 1
 fi
@@ -106,16 +110,7 @@ if ! echo "$XAI_API_KEY" | grep -q '^xai-'; then
     echo "WARNING: XAI_API_KEY doesn't start with 'xai-'. This may not be a valid xAI key." >&2
 fi
 
-# Resolve SHARED_SECRET if not already provided
-# Try Doppler first for SHARED_SECRET
-if [ -z "$SHARED_SECRET" ] && command -v doppler >/dev/null 2>&1; then
-    DOPPLER_SECRET=$(doppler secrets get SHARED_SECRET --project "$DOPPLER_PROJECT" --config "$DOPPLER_CONFIG" --plain 2>/dev/null || true)
-    if [ -n "$DOPPLER_SECRET" ]; then
-        export SHARED_SECRET="$DOPPLER_SECRET"
-    fi
-fi
-
-# Try .env file
+# Resolve SHARED_SECRET locally first for deterministic startup
 if [ -z "$SHARED_SECRET" ] && [ -f ".env" ]; then
     ENV_SHARED=$(grep -E '^SHARED_SECRET=' .env 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
     if [ -n "$ENV_SHARED" ]; then
@@ -123,11 +118,18 @@ if [ -z "$SHARED_SECRET" ] && [ -f ".env" ]; then
     fi
 fi
 
-# Try .envrc file
 if [ -z "$SHARED_SECRET" ] && [ -f ".envrc" ]; then
-    ENVRC_SHARED=$(grep -E '^export SHARED_SECRET=' .envrc 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    ENVRC_SHARED=$(grep -E '^[[:space:]]*(export[[:space:]]+)?SHARED_SECRET=' .envrc 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
     if [ -n "$ENVRC_SHARED" ]; then
         export SHARED_SECRET="$ENVRC_SHARED"
+    fi
+fi
+
+# Fall back to network-backed Doppler
+if [ -z "$SHARED_SECRET" ] && command -v doppler >/dev/null 2>&1; then
+    DOPPLER_SECRET=$(doppler secrets get SHARED_SECRET --project "$DOPPLER_PROJECT" --config "$DOPPLER_CONFIG" --plain 2>/dev/null || true)
+    if [ -n "$DOPPLER_SECRET" ]; then
+        export SHARED_SECRET="$DOPPLER_SECRET"
     fi
 fi
 

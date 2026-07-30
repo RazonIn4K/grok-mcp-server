@@ -102,6 +102,30 @@ describe("GrokClient.chatCompletion()", () => {
     );
   });
 
+  it('omits reasoning_effort when the compatibility value is "none"', async () => {
+    mockInstance.post.mockResolvedValueOnce({
+      data: {
+        choices: [{ message: { role: "assistant", content: "ok" } }],
+        id: "chat-id",
+        object: "chat.completion",
+        created: 123,
+        model: "grok-4.5",
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+
+    await client.chatCompletion({
+      model: "grok-4.5",
+      messages: [{ role: "user", content: "No reasoning" }],
+      reasoning_effort: "none",
+    });
+
+    expect(mockInstance.post).toHaveBeenCalledWith(
+      "/chat/completions",
+      expect.not.objectContaining({ reasoning_effort: expect.anything() }),
+    );
+  });
+
   it("wraps API errors as a plain Error from chatCompletion", async () => {
     const axiosError = Object.assign(new Error("Request failed"), {
       isAxiosError: true,
@@ -191,6 +215,85 @@ describe("GrokClient.ask()", () => {
       content: expect.stringContaining("Recent search results for context"),
     });
     expect(result).toBe("Search-aware response");
+  });
+
+  it("shares one deadline across search and chat without injecting degraded fallback text", async () => {
+    client = new GrokClient({
+      ...testConfig,
+      askOverallTimeoutMs: 2000,
+      searchOverallTimeoutMs: 5000,
+      timeoutMs: 45000,
+    });
+    const searchSpy = vi.spyOn(client, "liveSearch").mockResolvedValue({
+      results: [
+        {
+          title: "Live search temporarily unavailable",
+          url: "https://www.google.com/search?q=current",
+          snippet: "retry shortly",
+          source: "fallback",
+        },
+      ],
+      total_results: 1,
+      search_time: 1,
+      degraded: true,
+    });
+    mockInstance.post.mockResolvedValueOnce({
+      data: {
+        choices: [{ message: { role: "assistant", content: "Base answer" } }],
+        id: "chat-id",
+        object: "chat.completion",
+        created: 123,
+        model: "grok-4.5",
+        usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 },
+      },
+    });
+
+    const result = await client.ask("Current info", undefined, undefined, {
+      includeSearch: true,
+    });
+
+    expect(searchSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ query: "Current info" }),
+      1000,
+    );
+    expect(mockInstance.post).toHaveBeenCalledWith(
+      "/chat/completions",
+      expect.objectContaining({
+        messages: [{ role: "user", content: "Current info" }],
+      }),
+      expect.objectContaining({
+        timeout: expect.any(Number),
+      }),
+    );
+    const timeout = mockInstance.post.mock.calls[0][2].timeout;
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThanOrEqual(2000);
+    expect(result).toBe("Base answer");
+  });
+
+  it("skips search when the parent ask deadline cannot allocate a safe budget", async () => {
+    client = new GrokClient({
+      ...testConfig,
+      askOverallTimeoutMs: 1,
+    });
+    const searchSpy = vi.spyOn(client, "liveSearch");
+    mockInstance.post.mockResolvedValueOnce({
+      data: {
+        choices: [{ message: { role: "assistant", content: "Fast answer" } }],
+        id: "chat-id",
+        object: "chat.completion",
+        created: 123,
+        model: "grok-4.5",
+        usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 },
+      },
+    });
+
+    await expect(
+      client.ask("Fast", undefined, undefined, { includeSearch: true }),
+    ).resolves.toBe("Fast answer");
+
+    expect(searchSpy).not.toHaveBeenCalled();
+    expect(mockInstance.post.mock.calls[0][2]).toEqual({ timeout: 1 });
   });
 });
 
@@ -413,11 +516,47 @@ describe("GrokClient timeout and retry behavior", () => {
     mockedAxios.create = vi.fn().mockReturnValue(mockInstance);
   });
 
-  it("uses custom timeout from config", () => {
+  it("caps oversized per-attempt timeouts from config", () => {
     client = new GrokClient({ ...testConfig, timeoutMs: 120000 });
     expect(mockedAxios.create).toHaveBeenCalledWith(
-      expect.objectContaining({ timeout: 120000 }),
+      expect.objectContaining({ timeout: 45000 }),
     );
+  });
+
+  it("caps direct chat execution overrides and configured retry counts", async () => {
+    mockInstance.post.mockResolvedValueOnce({
+      data: {
+        choices: [{ message: { role: "assistant", content: "ok" } }],
+        id: "chat-id",
+        object: "chat.completion",
+        created: 123,
+        model: "grok-4.5",
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+    client = new GrokClient({
+      ...testConfig,
+      timeoutMs: 120000,
+      retries: 10,
+    });
+
+    await client.chatCompletion(
+      {
+        model: "grok-4.5",
+        messages: [{ role: "user", content: "bounded" }],
+      },
+      { timeoutMs: 120000, retries: 10 },
+    );
+
+    expect(mockInstance.post).toHaveBeenCalledWith(
+      "/chat/completions",
+      expect.any(Object),
+      { timeout: 45000 },
+    );
+    expect(client.getRuntimeStatus()).toMatchObject({
+      timeout_ms: 45000,
+      retries: 1,
+    });
   });
 
   it("retries chatCompletion on transient network failure and succeeds", async () => {
@@ -527,14 +666,89 @@ describe("GrokClient timeout and retry behavior", () => {
       },
     });
 
-    client = new GrokClient({ ...testConfig, searchTimeoutMs: 180000 });
+    client = new GrokClient({
+      ...testConfig,
+      searchTimeoutMs: 30000,
+      searchOverallTimeoutMs: 60000,
+    });
     await client.liveSearch({ query: "test" });
 
     expect(mockInstance.post).toHaveBeenCalledWith(
       "/responses",
       expect.any(Object),
-      expect.objectContaining({ timeout: 180000 }),
+      expect.objectContaining({ timeout: 30000 }),
     );
   });
-});
 
+  it("does not retry search by default and returns a truthful degraded result", async () => {
+    const timeoutError = Object.assign(new Error("request timed out"), {
+      isAxiosError: true,
+      code: "ECONNABORTED",
+    });
+    mockInstance.post.mockRejectedValueOnce(timeoutError);
+
+    client = new GrokClient({
+      ...testConfig,
+      searchTimeoutMs: 10,
+      searchOverallTimeoutMs: 20,
+    });
+    const result = await client.liveSearch({ query: "bounded timeout" });
+
+    expect(mockInstance.post).toHaveBeenCalledTimes(1);
+    expect(result.degraded).toBe(true);
+    expect(result.results[0]).toMatchObject({
+      title: "Live search temporarily unavailable",
+      source: "fallback",
+    });
+    expect(result.results[0].url).toContain(
+      "google.com/search?q=bounded%20timeout",
+    );
+    expect(result.search_time).toBeGreaterThanOrEqual(0);
+    expect(result.search_time).not.toBe(0.5);
+  });
+
+  it("does not begin a retry that cannot fit inside the overall search budget", async () => {
+    const transientError = Object.assign(new Error("temporary failure"), {
+      isAxiosError: true,
+      code: "ECONNRESET",
+    });
+    mockInstance.post.mockRejectedValueOnce(transientError);
+
+    client = new GrokClient({
+      ...testConfig,
+      searchRetries: 2,
+      retryDelayMs: 1000,
+      searchOverallTimeoutMs: 100,
+    });
+    const result = await client.liveSearch({ query: "retry budget" });
+
+    expect(mockInstance.post).toHaveBeenCalledTimes(1);
+    expect(result.degraded).toBe(true);
+  });
+
+  it("reports the active timeout and limiter configuration", () => {
+    client = new GrokClient({
+      ...testConfig,
+      timeoutMs: 45000,
+      askOverallTimeoutMs: 85000,
+      searchTimeoutMs: 30000,
+      searchOverallTimeoutMs: 70000,
+      retries: 1,
+      searchRetries: 0,
+    });
+
+    expect(client.getRuntimeStatus()).toMatchObject({
+      model: "grok-4.5",
+      timeout_ms: 45000,
+      ask_overall_timeout_ms: 85000,
+      search_timeout_ms: 30000,
+      search_overall_timeout_ms: 70000,
+      retries: 1,
+      search_retries: 0,
+      limiter: {
+        running: 0,
+        queued: 0,
+      },
+    });
+  });
+});

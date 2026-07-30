@@ -133,9 +133,12 @@ The server implements the Model Context Protocol and can be integrated with any 
 | `GROK_MAX_TOKENS` | `4000` | Maximum response tokens |
 | `LOG_LEVEL` | `info` | Logging verbosity |
 | `NODE_ENV` | `production` | Environment mode |
-| `GROK_TIMEOUT_MS` | `60000` | Request timeout for chat completions (milliseconds) |
-| `GROK_SEARCH_TIMEOUT_MS` | `120000` | Request timeout for live search / Responses API calls (milliseconds) |
-| `GROK_RETRIES` | `2` | Number of retries for transient failures (network errors, 5xx, 429) |
+| `GROK_TIMEOUT_MS` | `45000` | Per-attempt timeout for chat completions (milliseconds) |
+| `GROK_ASK_OVERALL_TIMEOUT_MS` | `90000` | End-to-end deadline for search-enabled answers (milliseconds) |
+| `GROK_SEARCH_TIMEOUT_MS` | `45000` | Per-attempt timeout for live search / Responses API calls (milliseconds) |
+| `GROK_SEARCH_OVERALL_TIMEOUT_MS` | `90000` | End-to-end deadline for live search and fallback (milliseconds) |
+| `GROK_RETRIES` | `1` | Number of retries for transient chat failures (network errors, 5xx, 429) |
+| `GROK_SEARCH_RETRIES` | `0` | Number of search retries; keep at `0` unless the overall deadline has room |
 | `GROK_RETRY_DELAY_MS` | `1000` | Base delay between retries; doubles with each attempt (milliseconds) |
 | `GROK_MAX_CONCURRENT` | `2` | Maximum concurrent requests to the xAI API |
 | `GROK_MIN_TIME_MS` | `500` | Minimum interval between requests to the xAI API (milliseconds) |
@@ -144,8 +147,9 @@ The server implements the Model Context Protocol and can be integrated with any 
 
 The server includes built-in resilience features:
 
-- **Configurable Timeouts**: Separate timeouts for chat and search/Responses API calls.
-- **Retries with Backoff**: Transient failures (network errors, 5xx, 429) are retried up to `GROK_RETRIES` times with exponential backoff.
+- **Bounded Timeouts**: Search and search-enabled answers use end-to-end deadlines that include fallbacks.
+- **Hard Safety Caps**: Per-attempt timeouts are capped at 45 seconds, overall tool work at 90 seconds, and retries at one so environment overrides cannot recreate multi-minute retry chains.
+- **Budget-Aware Retries**: Chat retries transient failures with exponential backoff. Search does not retry by default and never starts a retry that cannot fit within its overall deadline.
 - **Rate Limiting**: Configurable concurrency and minimum interval (`GROK_MAX_CONCURRENT`, `GROK_MIN_TIME_MS`).
 - **Caching**: 5-minute TTL LRU cache for responses.
 - **Connection Pooling**: HTTP agent with keep-alive connections.
@@ -201,7 +205,7 @@ The server exposes Prometheus metrics at `/metrics` (when health endpoint is cal
 ### Common Issues
 
 1. **"API key not found"**: Ensure `XAI_API_KEY` is set in your environment
-2. **"Connection timeout" / request timeouts**: Increase `GROK_TIMEOUT_MS` (default 60s) for long reasoning requests and `GROK_SEARCH_TIMEOUT_MS` (default 120s) for live search. Also check network connectivity and the API endpoint URL.
+2. **"Connection timeout" / request timeouts**: Keep `GROK_ASK_OVERALL_TIMEOUT_MS` and `GROK_SEARCH_OVERALL_TIMEOUT_MS` below the MCP client's tool timeout. Check provider/network health before increasing per-attempt timeouts; larger values can make an unavailable provider look like a hung MCP tool.
 3. **"Rate limit exceeded"**: Implement client-side rate limiting or increase intervals
 4. **"Model not available"**: Verify the model name is correct and supported; retired slugs now alias to current models
 

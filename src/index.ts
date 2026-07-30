@@ -13,6 +13,7 @@ import {
 import fs from "fs";
 import path from "path";
 import { GrokClient } from "./grok-client.js";
+import { toSafeError } from "./safe-error.js";
 import { GrokConfig } from "./types.js";
 import pino from "pino";
 import {
@@ -59,6 +60,21 @@ loadEnvironment();
 
 const logger = pino({
   level: process.env.LOG_LEVEL || "info",
+  redact: {
+    paths: [
+      "apiKey",
+      "*.apiKey",
+      "headers.Authorization",
+      "headers.authorization",
+      "config.headers.Authorization",
+      "config.headers.authorization",
+      "err.config.headers.Authorization",
+      "err.config.headers.authorization",
+      "err.request._options.headers.Authorization",
+      "err.request._options.headers.authorization",
+    ],
+    censor: "[REDACTED]",
+  },
   transport:
     process.env.NODE_ENV !== "production"
       ? {
@@ -107,6 +123,15 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
 }
 
+function parseNonNegativeInt(
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (!value) return fallback;
+  const parsed = parseInt(value, 10);
+  return Number.isNaN(parsed) || parsed < 0 ? fallback : parsed;
+}
+
 const grokConfig: GrokConfig = {
   apiKey: process.env.XAI_API_KEY!,
   baseUrl,
@@ -115,9 +140,18 @@ const grokConfig: GrokConfig = {
   maxTokens: parseInt(process.env.GROK_MAX_TOKENS || "4000"),
   perplexityApiKey: process.env.PERPLEXITY_API_KEY,
   perplexityModel: process.env.PERPLEXITY_MODEL || "sonar-reasoning-pro",
-  timeoutMs: parsePositiveInt(process.env.GROK_TIMEOUT_MS, 60000),
-  searchTimeoutMs: parsePositiveInt(process.env.GROK_SEARCH_TIMEOUT_MS, 120000),
-  retries: parsePositiveInt(process.env.GROK_RETRIES, 2),
+  timeoutMs: parsePositiveInt(process.env.GROK_TIMEOUT_MS, 45000),
+  askOverallTimeoutMs: parsePositiveInt(
+    process.env.GROK_ASK_OVERALL_TIMEOUT_MS,
+    90000,
+  ),
+  searchTimeoutMs: parsePositiveInt(process.env.GROK_SEARCH_TIMEOUT_MS, 45000),
+  searchOverallTimeoutMs: parsePositiveInt(
+    process.env.GROK_SEARCH_OVERALL_TIMEOUT_MS,
+    90000,
+  ),
+  retries: parseNonNegativeInt(process.env.GROK_RETRIES, 1),
+  searchRetries: parseNonNegativeInt(process.env.GROK_SEARCH_RETRIES, 0),
   retryDelayMs: parsePositiveInt(process.env.GROK_RETRY_DELAY_MS, 1000),
   maxConcurrent: parsePositiveInt(process.env.GROK_MAX_CONCURRENT, 2),
   minTimeMs: parsePositiveInt(process.env.GROK_MIN_TIME_MS, 500),
@@ -373,7 +407,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "grok_health",
-        description: "Check the health of the MCP server and its dependencies",
+        description:
+          "Check the MCP server process, runtime budgets, and in-process metrics. Use grok_test_connection for a live xAI dependency probe.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -484,7 +519,7 @@ async function safeAsk(
   try {
     return await grokClient.ask(question, context, systemPrompt, options);
   } catch (err: any) {
-    logger.error({ err }, "safeAsk error");
+    logger.error({ error: toSafeError(err) }, "safeAsk error");
     // Return the actual error message if available
     throw new ExternalServiceError(
       err?.message ? `Grok ask failed: ${err.message}` : "Grok ask failed",
@@ -498,7 +533,7 @@ async function safeChat(args: any) {
   try {
     return await grokClient.chatCompletion(args);
   } catch (err: any) {
-    logger.error({ err }, "safeChat error");
+    logger.error({ error: toSafeError(err) }, "safeChat error");
     // Return the actual error message if available
     throw new ExternalServiceError(
       err?.message ? `Grok chat failed: ${err.message}` : "Grok chat failed",
@@ -512,7 +547,7 @@ async function safeSearch(args: any) {
   try {
     return await grokClient.liveSearch(args);
   } catch (err: any) {
-    logger.error({ err }, "safeSearch error");
+    logger.error({ error: toSafeError(err) }, "safeSearch error");
     // Return the actual error message if available
     throw new ExternalServiceError(
       err?.message
@@ -715,7 +750,7 @@ async function handleToolCall(request: any) {
               }
             } catch (searchErr) {
               logger.warn(
-                { err: searchErr },
+                { error: toSafeError(searchErr) },
                 "Search injection failed for grok_chat, proceeding without",
               );
             }
@@ -822,7 +857,10 @@ async function handleToolCall(request: any) {
           .map((r, i) => `${i + 1}. [${r.title}](${r.url})`)
           .join("\n");
 
-        const outputText = `Search Results for "${query}" (${searchResults.total_results} results found in ${searchResults.search_time}s):\n\n${formattedResults}\n\nSources:\n${sourcesList || "No direct sources returned."}`;
+        const statusText = searchResults.degraded
+          ? "DEGRADED: live-search providers exceeded the request budget; showing a retry link."
+          : "OK";
+        const outputText = `Search Results for "${query}" (${searchResults.total_results} results found in ${searchResults.search_time}s)\nStatus: ${statusText}\n\n${formattedResults}\n\nSources:\n${sourcesList || "No direct sources returned."}`;
 
         end();
         return {
@@ -869,7 +907,7 @@ async function handleToolCall(request: any) {
           content: [
             {
               type: "text",
-              text: `X Search Results for "${xQuery}" (${xSearchResults.total_results} results in ${xSearchResults.search_time}s):\n\n${xFormatted}\n\nSources:\n${xSources || "No sources."}`,
+              text: `X Search Results for "${xQuery}" (${xSearchResults.total_results} results in ${xSearchResults.search_time}s)\nStatus: ${xSearchResults.degraded ? "DEGRADED: live-search providers exceeded the request budget; showing a retry link." : "OK"}\n\n${xFormatted}\n\nSources:\n${xSources || "No sources."}`,
             },
           ],
         };
@@ -884,7 +922,10 @@ async function handleToolCall(request: any) {
         end();
         return {
           content: [
-            { type: "text", text: "OK: Grok MCP Server healthy" },
+            {
+              type: "text",
+              text: `OK: Grok MCP Server process healthy\n${JSON.stringify(grokClient.getRuntimeStatus())}`,
+            },
             { type: "text", text: metricsText },
           ],
         };
@@ -946,7 +987,7 @@ async function main() {
 // Start the server only if this file is run directly
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((error) => {
-    logger.error({ err: error }, "Failed to start server");
+    logger.error({ error: toSafeError(error) }, "Failed to start server");
     process.exit(1);
   });
 }

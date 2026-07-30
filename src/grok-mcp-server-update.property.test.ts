@@ -42,6 +42,12 @@ vi.mock("./grok-client.js", () => {
     liveSearch: vi.fn().mockResolvedValue({ results: [], total_results: 0, search_time: 0 }),
     getModels: vi.fn().mockResolvedValue(["grok-4.5"]),
     testConnection: vi.fn().mockResolvedValue(true),
+    getRuntimeStatus: vi.fn().mockReturnValue({
+      timeout_ms: 45000,
+      ask_overall_timeout_ms: 90000,
+      search_overall_timeout_ms: 90000,
+      search_retries: 0,
+    }),
   }));
   return { GrokClient };
 });
@@ -295,7 +301,12 @@ describe("Property-Based Tests: Grok MCP Server Update", () => {
         // Must have exactly 2 content items
         expect(result.content).toHaveLength(2);
         // First item must be the status text
-        expect(result.content[0].text).toBe("OK: Grok MCP Server healthy");
+        expect(result.content[0].text).toContain(
+          "OK: Grok MCP Server process healthy",
+        );
+        expect(result.content[0].text).toContain(
+          '"search_overall_timeout_ms":90000',
+        );
         // Second item must be a string (metrics or error description)
         expect(typeof result.content[1].text).toBe("string");
         // Must NOT have a top-level "metrics" field
