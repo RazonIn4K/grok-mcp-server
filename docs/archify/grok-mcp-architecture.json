@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "grok-mcp-server",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1280,
+      860
+    ],
+    "views": [
+      {
+        "id": "stdio-path",
+        "label": "stdio to xAI",
+        "focus": [
+          "mcp-client",
+          "stdio-server",
+          "xai"
+        ],
+        "note": "MCP client talks stdio JSON-RPC to grok-mcp-server, then HTTPS to api.x.ai/v1."
+      },
+      {
+        "id": "perplexity-fallback",
+        "label": "Perplexity fallback",
+        "focus": [
+          "stdio-server",
+          "perplexity"
+        ],
+        "note": "Optional Perplexity sonar-* fallback when PERPLEXITY_API_KEY is set."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "mcp-client",
+      "type": "frontend",
+      "label": "MCP client",
+      "sublabel": "Cursor / Claude Code",
+      "pos": [
+        40,
+        372
+      ],
+      "size": [
+        170,
+        72
+      ]
+    },
+    {
+      "id": "stdio-server",
+      "type": "backend",
+      "label": "grok-mcp-server",
+      "sublabel": "stdio JSON-RPC",
+      "pos": [
+        300,
+        364
+      ],
+      "size": [
+        210,
+        88
+      ]
+    },
+    {
+      "id": "xai",
+      "type": "external",
+      "label": "xAI Grok API",
+      "sublabel": "api.x.ai/v1",
+      "pos": [
+        720,
+        368
+      ],
+      "size": [
+        190,
+        80
+      ]
+    },
+    {
+      "id": "perplexity",
+      "type": "external",
+      "label": "Perplexity",
+      "sublabel": "sonar-* fallback",
+      "brand": "perplexity",
+      "pos": [
+        300,
+        620
+      ],
+      "size": [
+        210,
+        68
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "User environment",
+      "wraps": [
+        "mcp-client",
+        "stdio-server"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "Upstream APIs",
+      "wraps": [
+        "xai",
+        "perplexity"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "client-server",
+      "from": "mcp-client",
+      "to": "stdio-server",
+      "label": "stdio JSON-RPC",
+      "variant": "emphasis"
+    },
+    {
+      "id": "server-xai",
+      "from": "stdio-server",
+      "to": "xai",
+      "label": "HTTPS Bearer XAI_API_KEY",
+      "variant": "emphasis",
+      "labelDy": 36
+    },
+    {
+      "id": "server-perplexity",
+      "from": "stdio-server",
+      "to": "perplexity",
+      "label": "optional search fallback",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "stdio server",
+      "items": [
+        "MCP client spawns node dist/index.js and talks stdin/stdout JSON-RPC",
+        "SHARED_SECRET is required at startup; logs go to stderr only"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "xAI tools",
+      "items": [
+        "grok_ask, grok_chat, grok_search, grok_x_search, grok_models, grok_test_connection, grok_health",
+        "Upstream: POST /chat/completions, POST /responses, GET /models"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Optional fallback",
+      "items": [
+        "If PERPLEXITY_API_KEY is set, search can fall back to Perplexity sonar-* models",
+        "Default model is grok-4.5 at https://api.x.ai/v1"
+      ]
+    }
+  ]
+}
