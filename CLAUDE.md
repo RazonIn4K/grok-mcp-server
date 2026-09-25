@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Model Context Protocol (MCP) server that integrates xAI's Grok 4.5 AI model with Claude Code and other MCP-compatible applications. The server provides tools for chat completion, live search, and function calling capabilities.
+This is a Model Context Protocol (MCP) server that integrates current xAI Grok models with Claude Code and other MCP-compatible applications. It defaults text and live-search calls to Grok 4.7.
 
 ## Development Commands
 
@@ -24,7 +24,8 @@ This is a Model Context Protocol (MCP) server that integrates xAI's Grok 4.5 AI 
   - `XAI_API_KEY` - Required xAI API key (starts with `xai-`)
   - `SHARED_SECRET` - Required shared secret used for MCP auth
   - `XAI_BASE_URL` - API base URL (defaults to `https://api.x.ai/v1`)
-  - `GROK_MODEL` - Model to use (defaults to `grok-4.5`)
+  - `GROK_MODEL` - Ask/chat model (defaults to `grok-4.7`)
+  - `GROK_SEARCH_MODEL` - Web/X search model (defaults to `grok-4.7`)
 
 ## Architecture
 
@@ -36,7 +37,7 @@ This is a Model Context Protocol (MCP) server that integrates xAI's Grok 4.5 AI 
 - LRU caching (5-minute TTL)
 - Rate limiting (2 concurrent requests, 500ms intervals)
 - Connection pooling with keep-alive
-- Fallback search simulation when live search unavailable
+- Explicit degraded retry links when live search is unavailable
 
 **Type Definitions (`src/types.ts`)**: TypeScript interfaces for Grok API requests/responses, including chat completion, search, and configuration types.
 
@@ -54,18 +55,18 @@ This is a Model Context Protocol (MCP) server that integrates xAI's Grok 4.5 AI 
 
 ### Key Features
 
-- **Authentication**: Shared secret validation with timing-safe comparison
+- **Access**: Trusted local stdio transport; credentials are required at startup. Any HTTP gateway must enforce its own access controls.
 - **Input Sanitization**: Recursive sanitization of user inputs
 - **Monitoring**: Prometheus metrics for latency, request counts, and errors
 - **Caching**: LRU cache for API responses to reduce costs
 - **Rate Limiting**: Bottleneck library prevents API abuse
-- **Graceful Degradation**: Search simulation when live search unavailable
+- **Graceful Degradation**: Explicit degraded search responses when providers are unavailable
 
 ### Dependencies
 
 - **Runtime**: `@modelcontextprotocol/sdk`, `axios`, `dotenv`, `pino`
 - **Performance**: `lru-cache`, `bottleneck`, `agentkeepalive`
-- **Monitoring**: `prom-client`, `opossum`
+- **Monitoring**: `prom-client`
 - **Validation**: `zod`
 - **Testing**: `vitest`, `@vitest/coverage-v8`
 

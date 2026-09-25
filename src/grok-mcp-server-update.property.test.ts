@@ -14,15 +14,19 @@ const _envSetup = vi.hoisted(() => {
 vi.mock("prom-client", async () => {
   const actual = await vi.importActual<typeof import("prom-client")>("prom-client");
   const registry = new actual.Registry();
-  const Histogram = vi.fn().mockImplementation((_opts: any) => ({
+  const Histogram = vi.fn().mockImplementation(function (_opts: any) {
+    return {
     startTimer: vi.fn().mockReturnValue(vi.fn()),
     observe: vi.fn(),
     labels: vi.fn().mockReturnThis(),
-  }));
-  const Counter = vi.fn().mockImplementation((_opts: any) => ({
+    };
+  });
+  const Counter = vi.fn().mockImplementation(function (_opts: any) {
+    return {
     inc: vi.fn(),
     labels: vi.fn().mockReturnThis(),
-  }));
+    };
+  });
   // prom-client uses named exports only (no default export in its type definitions)
   return {
     ...actual,
@@ -34,7 +38,8 @@ vi.mock("prom-client", async () => {
 
 // Mock GrokClient
 vi.mock("./grok-client.js", () => {
-  const GrokClient = vi.fn().mockImplementation(() => ({
+  const GrokClient = vi.fn().mockImplementation(function () {
+    return {
     ask: vi.fn().mockResolvedValue("mock response"),
     chatCompletion: vi.fn().mockResolvedValue({
       choices: [{ message: { content: "mock chat response" } }],
@@ -42,8 +47,15 @@ vi.mock("./grok-client.js", () => {
     liveSearch: vi.fn().mockResolvedValue({ results: [], total_results: 0, search_time: 0 }),
     getModels: vi.fn().mockResolvedValue(["grok-4.5"]),
     testConnection: vi.fn().mockResolvedValue(true),
-  }));
-  return { GrokClient };
+    getRuntimeStatus: vi.fn().mockReturnValue({
+      timeout_ms: 45000,
+      ask_overall_timeout_ms: 90000,
+      search_overall_timeout_ms: 90000,
+      search_retries: 0,
+    }),
+    };
+  });
+  return { GrokClient, DEFAULT_GROK_MODEL: "grok-4.7", DEFAULT_GROK_SEARCH_MODEL: "grok-4.7" };
 });
 
 import { handleToolCall, grokClient } from "./index.js";
@@ -134,6 +146,85 @@ describe("Property-Based Tests: Grok MCP Server Update", () => {
       }),
       { numRuns: 100 },
     );
+  });
+
+  it("grok_ask search flags enable search without a redundant include_search flag", async () => {
+    let capturedOptions: any;
+    (grokClient.ask as any).mockImplementationOnce(
+      async (_question: any, _context: any, _systemPrompt: any, options: any) => {
+        capturedOptions = options;
+        return "search-enabled";
+      },
+    );
+
+    const result = await handleToolCall({
+      params: {
+        name: "grok_ask",
+        arguments: { question: "current news", include_x_search: true },
+      },
+    });
+
+    expect(capturedOptions).toMatchObject({
+      includeSearch: true,
+      include_x_search: true,
+    });
+    expect(result.content[0].text).toBe("search-enabled");
+  });
+
+  it("invalid chat input is marked as an MCP tool error", async () => {
+    const result = await handleToolCall({
+      params: { name: "grok_chat", arguments: { messages: [] } },
+    });
+
+    expect("isError" in result && result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/^Error: Invalid input for grok_chat/);
+  });
+
+  it("preserves code and quoted text through ask, chat, and search", async () => {
+    const code = 'if (a < b) return "hello"; // `quoted` <tag>';
+    await handleToolCall({ params: { name: "grok_ask", arguments: {
+      question: code, context: code, system_prompt: code,
+    } } });
+    expect(grokClient.ask).toHaveBeenLastCalledWith(code, code, code, expect.any(Object));
+
+    await handleToolCall({ params: { name: "grok_chat", arguments: {
+      messages: [{ role: "user", content: code }],
+    } } });
+    expect(grokClient.chatCompletion).toHaveBeenLastCalledWith(
+      expect.objectContaining({ messages: [{ role: "user", content: code }] }), undefined,
+    );
+
+    await handleToolCall({ params: { name: "grok_search", arguments: { query: code } } });
+    expect(grokClient.liveSearch).toHaveBeenLastCalledWith(
+      expect.objectContaining({ query: code }), undefined,
+    );
+  });
+
+  it("redacts credentials in user-facing errors as well as logs", async () => {
+    vi.mocked(grokClient.ask).mockRejectedValueOnce(new Error("Provider failed with password=fake-password"));
+    const result = await handleToolCall({ params: { name: "grok_ask", arguments: { question: "test" } } });
+    expect(result.content[0].text).toContain("[REDACTED]");
+    expect(result.content[0].text).not.toContain("fake-password");
+    expect("isError" in result && result.isError).toBe(true);
+  });
+
+  it("reserves answer time when chat requests search context", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    vi.mocked(grokClient.liveSearch).mockImplementationOnce(async () => {
+      now.mockReturnValue(31000);
+      return { results: [], total_results: 0, search_time: 30 };
+    });
+    try {
+      await handleToolCall({ params: { name: "grok_chat", arguments: {
+        messages: [{ role: "user", content: "news" }], include_search: true,
+      } } });
+      expect(grokClient.liveSearch).toHaveBeenLastCalledWith(expect.any(Object), 45000);
+      expect(grokClient.chatCompletion).toHaveBeenLastCalledWith(
+        expect.any(Object), { timeoutMs: 45000, overallTimeoutMs: 60000, retries: 0 },
+      );
+    } finally {
+      now.mockRestore();
+    }
   });
 
   // Property 4: Chat tool handles message arrays and surfaces assistant content
@@ -295,7 +386,12 @@ describe("Property-Based Tests: Grok MCP Server Update", () => {
         // Must have exactly 2 content items
         expect(result.content).toHaveLength(2);
         // First item must be the status text
-        expect(result.content[0].text).toBe("OK: Grok MCP Server healthy");
+        expect(result.content[0].text).toContain(
+          "OK: Grok MCP Server process healthy",
+        );
+        expect(result.content[0].text).toContain(
+          '"search_overall_timeout_ms":90000',
+        );
         // Second item must be a string (metrics or error description)
         expect(typeof result.content[1].text).toBe("string");
         // Must NOT have a top-level "metrics" field

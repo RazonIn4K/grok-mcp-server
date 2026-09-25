@@ -12,7 +12,12 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import fs from "fs";
 import path from "path";
-import { GrokClient } from "./grok-client.js";
+import {
+  DEFAULT_GROK_MODEL,
+  DEFAULT_GROK_SEARCH_MODEL,
+  GrokClient,
+} from "./grok-client.js";
+import { redactSecrets, toSafeError } from "./safe-error.js";
 import { GrokConfig } from "./types.js";
 import pino from "pino";
 import {
@@ -59,6 +64,21 @@ loadEnvironment();
 
 const logger = pino({
   level: process.env.LOG_LEVEL || "info",
+  redact: {
+    paths: [
+      "apiKey",
+      "*.apiKey",
+      "headers.Authorization",
+      "headers.authorization",
+      "config.headers.Authorization",
+      "config.headers.authorization",
+      "err.config.headers.Authorization",
+      "err.config.headers.authorization",
+      "err.request._options.headers.Authorization",
+      "err.request._options.headers.authorization",
+    ],
+    censor: "[REDACTED]",
+  },
   transport:
     process.env.NODE_ENV !== "production"
       ? {
@@ -107,17 +127,36 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
 }
 
+function parseNonNegativeInt(
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (!value) return fallback;
+  const parsed = parseInt(value, 10);
+  return Number.isNaN(parsed) || parsed < 0 ? fallback : parsed;
+}
+
 const grokConfig: GrokConfig = {
   apiKey: process.env.XAI_API_KEY!,
   baseUrl,
-  model: process.env.GROK_MODEL || "grok-4.5",
+  model: process.env.GROK_MODEL || DEFAULT_GROK_MODEL,
+  searchModel: process.env.GROK_SEARCH_MODEL || DEFAULT_GROK_SEARCH_MODEL,
   temperature: parseFloat(process.env.GROK_TEMPERATURE || "0.7"),
   maxTokens: parseInt(process.env.GROK_MAX_TOKENS || "4000"),
   perplexityApiKey: process.env.PERPLEXITY_API_KEY,
   perplexityModel: process.env.PERPLEXITY_MODEL || "sonar-reasoning-pro",
-  timeoutMs: parsePositiveInt(process.env.GROK_TIMEOUT_MS, 60000),
-  searchTimeoutMs: parsePositiveInt(process.env.GROK_SEARCH_TIMEOUT_MS, 120000),
-  retries: parsePositiveInt(process.env.GROK_RETRIES, 2),
+  timeoutMs: parsePositiveInt(process.env.GROK_TIMEOUT_MS, 45000),
+  askOverallTimeoutMs: parsePositiveInt(
+    process.env.GROK_ASK_OVERALL_TIMEOUT_MS,
+    90000,
+  ),
+  searchTimeoutMs: parsePositiveInt(process.env.GROK_SEARCH_TIMEOUT_MS, 45000),
+  searchOverallTimeoutMs: parsePositiveInt(
+    process.env.GROK_SEARCH_OVERALL_TIMEOUT_MS,
+    90000,
+  ),
+  retries: parseNonNegativeInt(process.env.GROK_RETRIES, 1),
+  searchRetries: parseNonNegativeInt(process.env.GROK_SEARCH_RETRIES, 0),
   retryDelayMs: parsePositiveInt(process.env.GROK_RETRY_DELAY_MS, 1000),
   maxConcurrent: parsePositiveInt(process.env.GROK_MAX_CONCURRENT, 2),
   minTimeMs: parsePositiveInt(process.env.GROK_MIN_TIME_MS, 500),
@@ -128,7 +167,7 @@ const grokClient = new GrokClient(grokConfig);
 const server = new Server(
   {
     name: process.env.MCP_SERVER_NAME || "grok-mcp-server",
-    version: process.env.MCP_SERVER_VERSION || "2.0.0",
+    version: process.env.MCP_SERVER_VERSION || "2.3.0",
   },
   {
     capabilities: {
@@ -146,13 +185,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "grok_ask",
         description:
-          "Ask Grok 4.5 a question with optional context and system prompt. Supports web search (with modern image understanding/search and X search options via enable_* / include_x_search flags).",
+          `Ask the configured Grok model (${grokConfig.model}) a question with optional context and system prompt. Search flags automatically enable search context.`,
         inputSchema: {
           type: "object",
           properties: {
             question: {
               type: "string",
-              description: "The question to ask Grok 4.5",
+              description: "The question to ask Grok",
             },
             context: {
               type: "string",
@@ -194,12 +233,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             model: {
               type: "string",
-              description: "Grok model to use (e.g., grok-4.5)",
+              description: `Grok text model to use (defaults to ${grokConfig.model})`,
             },
             reasoning_effort: {
               type: "string",
-              enum: ["none", "low", "medium", "high"],
-              description: "Reasoning effort for Grok chat responses",
+              enum: ["none", "low", "medium", "high", "xhigh"],
+              description:
+                "Reasoning effort where supported. Grok 4.7 accepts low/medium/high/xhigh. Grok 4.20 reasoning mode is selected by model slug, so this value is omitted for that family.",
             },
           },
           required: ["question"],
@@ -208,7 +248,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "grok_chat",
         description:
-          "Have a multi-turn conversation with Grok 4.5 using the chat completion API. Supports optional web/X search context injection via include_search and modern flags.",
+          `Have a multi-turn conversation using the configured Grok model (${grokConfig.model}). Search flags automatically enable search context.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -226,19 +266,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                   content: {
                     type: "string",
                     description: "Content of the message",
+                    minLength: 1,
                   },
                 },
                 required: ["role", "content"],
               },
+              minItems: 1,
             },
             model: {
               type: "string",
-              description: "Grok model to use (defaults to grok-4.5)",
+              description: `Grok text model to use (defaults to ${grokConfig.model})`,
             },
             reasoning_effort: {
               type: "string",
-              enum: ["none", "low", "medium", "high"],
-              description: "Reasoning effort for Grok chat responses",
+              enum: ["none", "low", "medium", "high", "xhigh"],
+              description:
+                "Reasoning effort where supported. Grok 4.7 accepts low/medium/high/xhigh. Grok 4.20 reasoning mode is selected by model slug, so this value is omitted for that family.",
             },
             temperature: {
               type: "number",
@@ -326,7 +369,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 from_date: { type: "string" },
                 to_date: { type: "string" },
                 return_citations: { type: "boolean" },
-                sources: { type: "array" },
+                sources: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      type: {
+                        type: "string",
+                        enum: ["web", "x", "news", "rss"],
+                      },
+                      max_results: { type: "number", minimum: 1 },
+                      country: { type: "string" },
+                      excluded_websites: {
+                        type: "array",
+                        items: { type: "string" },
+                        maxItems: 5,
+                      },
+                      allowed_websites: {
+                        type: "array",
+                        items: { type: "string" },
+                        maxItems: 5,
+                      },
+                    },
+                    required: ["type"],
+                  },
+                },
               },
             },
           },
@@ -373,7 +440,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "grok_health",
-        description: "Check the health of the MCP server and its dependencies",
+        description:
+          "Check the MCP server process, runtime budgets, and in-process metrics. Use grok_test_connection for a live xAI dependency probe.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -397,10 +465,11 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   };
 });
 
-// Sanitize utility (basic example)
+// Preserve prompt text verbatim: code, quoted phrases, and comparison operators
+// are meaningful model inputs. Validate values with Zod and filter unsafe keys.
 function sanitize(obj: any): any {
   if (typeof obj === "string") {
-    return obj.replace(/[<>"'`]/g, "");
+    return obj;
   } else if (Array.isArray(obj)) {
     return obj.map(sanitize);
   } else if (obj && typeof obj === "object") {
@@ -441,7 +510,7 @@ function warnIfDeprecated(model: string | undefined): void {
   if (model && DEPRECATED_MODELS.has(model)) {
     logger.warn(
       { deprecatedModel: model, replacement: DEPRECATED_MODEL_REPLACEMENTS[model] },
-      `Model "${model}" is deprecated and will be removed on May 15 2026. ` +
+      `Model "${model}" was retired on May 15, 2026. ` +
       `Use "${DEPRECATED_MODEL_REPLACEMENTS[model]}" instead.`,
     );
   }
@@ -477,14 +546,14 @@ async function safeAsk(
     enable_image_understanding?: boolean;
     enable_image_search?: boolean;
     include_x_search?: boolean;
-    reasoningEffort?: "none" | "low" | "medium" | "high";
+    reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
     model?: string;
   },
 ) {
   try {
     return await grokClient.ask(question, context, systemPrompt, options);
   } catch (err: any) {
-    logger.error({ err }, "safeAsk error");
+    logger.error({ error: toSafeError(err) }, "safeAsk error");
     // Return the actual error message if available
     throw new ExternalServiceError(
       err?.message ? `Grok ask failed: ${err.message}` : "Grok ask failed",
@@ -494,11 +563,15 @@ async function safeAsk(
   }
 }
 
-async function safeChat(args: any) {
+async function safeChat(args: any, execution?: {
+  timeoutMs: number;
+  overallTimeoutMs: number;
+  retries: number;
+}) {
   try {
-    return await grokClient.chatCompletion(args);
+    return await grokClient.chatCompletion(args, execution);
   } catch (err: any) {
-    logger.error({ err }, "safeChat error");
+    logger.error({ error: toSafeError(err) }, "safeChat error");
     // Return the actual error message if available
     throw new ExternalServiceError(
       err?.message ? `Grok chat failed: ${err.message}` : "Grok chat failed",
@@ -508,11 +581,11 @@ async function safeChat(args: any) {
   }
 }
 
-async function safeSearch(args: any) {
+async function safeSearch(args: any, overallTimeoutMs?: number) {
   try {
-    return await grokClient.liveSearch(args);
+    return await grokClient.liveSearch(args, overallTimeoutMs);
   } catch (err: any) {
-    logger.error({ err }, "safeSearch error");
+    logger.error({ error: toSafeError(err) }, "safeSearch error");
     // Return the actual error message if available
     throw new ExternalServiceError(
       err?.message
@@ -536,10 +609,11 @@ function handleError(error: any) {
     message = error.message;
   }
   return {
+    isError: true,
     content: [
       {
         type: "text",
-        text: `Error: ${message}`,
+        text: `Error: ${redactSecrets(message)}`,
       },
     ],
   };
@@ -584,6 +658,7 @@ async function handleToolCall(request: any) {
               z.literal("low"),
               z.literal("medium"),
               z.literal("high"),
+              z.literal("xhigh"),
             ])
             .optional(),
         });
@@ -609,10 +684,15 @@ async function handleToolCall(request: any) {
         } = parsed.data;
         const coercedMaxTokens =
           max_tokens !== undefined ? Math.floor(max_tokens) : undefined;
+        const shouldSearch =
+          include_search ||
+          enable_image_understanding ||
+          enable_image_search ||
+          include_x_search;
         const response = await safeAsk(question, context, system_prompt, {
           temperature,
           maxTokens: coercedMaxTokens,
-          includeSearch: include_search,
+          includeSearch: shouldSearch,
           enable_image_understanding,
           enable_image_search,
           include_x_search,
@@ -630,13 +710,19 @@ async function handleToolCall(request: any) {
         };
       }
       case "grok_chat": {
+        const startedAt = Date.now();
+        const runtime = grokClient.getRuntimeStatus();
+        const remainingBudgetMs = () =>
+          runtime.ask_overall_timeout_ms - (Date.now() - startedAt);
         const grokChatSchema = z.object({
-          messages: z.array(
-            z.object({
-              role: z.enum(["system", "user", "assistant"]),
-              content: z.string(),
-            }),
-          ),
+          messages: z
+            .array(
+              z.object({
+                role: z.enum(["system", "user", "assistant"]),
+                content: z.string().min(1),
+              }),
+            )
+            .min(1),
           model: z.string().optional(),
           reasoning_effort: z
             .union([
@@ -644,6 +730,7 @@ async function handleToolCall(request: any) {
               z.literal("low"),
               z.literal("medium"),
               z.literal("high"),
+              z.literal("xhigh"),
             ])
             .optional(),
           temperature: z.number().min(0).max(1).optional(),
@@ -695,8 +782,8 @@ async function handleToolCall(request: any) {
                 enable_image_understanding,
                 enable_image_search,
                 include_x_search,
-              });
-              if (searchResults.results.length > 0) {
+              }, Math.max(1, Math.floor(remainingBudgetMs() / 2)));
+              if (!searchResults.degraded && searchResults.results.length > 0) {
                 const searchContext = searchResults.results
                   .map(
                     (r: any, i: number) =>
@@ -715,20 +802,28 @@ async function handleToolCall(request: any) {
               }
             } catch (searchErr) {
               logger.warn(
-                { err: searchErr },
+                { error: toSafeError(searchErr) },
                 "Search injection failed for grok_chat, proceeding without",
               );
             }
           }
         }
 
+        const remainingMs = remainingBudgetMs();
+        if (remainingMs <= 0) {
+          throw new ExternalServiceError("Grok chat deadline exhausted", 504);
+        }
         const response = await safeChat({
           messages: chatMessages,
           model,
           reasoning_effort,
           temperature,
           max_tokens: coercedMaxTokens,
-        });
+        }, shouldSearch ? {
+          timeoutMs: Math.min(runtime.timeout_ms, remainingMs),
+          overallTimeoutMs: remainingMs,
+          retries: 0,
+        } : undefined);
         const assistantMessage =
           response.choices[0]?.message?.content || "No response generated";
         end();
@@ -760,8 +855,8 @@ async function handleToolCall(request: any) {
           to_date: z.string().optional(),
         });
         const grokSearchSchema = z.object({
-          query: z.string(),
-          max_results: z.number().int().optional(), // ensure integer
+          query: z.string().min(1),
+          max_results: z.number().int().min(1).max(20).optional(),
           include_news: z.boolean().optional(),
           time_filter: z
             .enum(["day", "week", "month", "year", "all"])
@@ -774,7 +869,7 @@ async function handleToolCall(request: any) {
           search_parameters: grokSearchParametersSchema.optional(),
         });
         // Coerce max_results to integer if needed
-        if (safeArgs.max_results) {
+        if (safeArgs?.max_results) {
           safeArgs.max_results = Math.floor(Number(safeArgs.max_results));
         }
         const parsed = grokSearchSchema.safeParse(safeArgs);
@@ -813,16 +908,23 @@ async function handleToolCall(request: any) {
         const formattedResults = searchResults.results
           .map(
             (result, index) =>
-              `${index + 1}. [${result.title}](${result.url})\n${result.snippet}${result.published_date ? `\nPublished: ${result.published_date}` : ""}`,
+              `${index + 1}. ${result.url ? `[${result.title}](${result.url})` : result.title}\n${result.snippet}${result.published_date ? `\nPublished: ${result.published_date}` : ""}`,
           )
           .join("\n\n");
 
         // Build a clean sources list for citations
         const sourcesList = searchResults.results
+          .filter((r) => Boolean(r.url))
           .map((r, i) => `${i + 1}. [${r.title}](${r.url})`)
           .join("\n");
 
-        const outputText = `Search Results for "${query}" (${searchResults.total_results} results found in ${searchResults.search_time}s):\n\n${formattedResults}\n\nSources:\n${sourcesList || "No direct sources returned."}`;
+        const statusText = searchResults.degraded
+          ? "DEGRADED: live-search providers exceeded the request budget; showing a retry link."
+          : "OK";
+        const summaryBlock = searchResults.summary
+          ? `\nSummary:\n${searchResults.summary}\n`
+          : "";
+        const outputText = `Search Results for "${query}" (${searchResults.total_results} results found in ${searchResults.search_time}s)\nStatus: ${statusText}\n${summaryBlock}\n${formattedResults}\n\nSources:\n${sourcesList || "No direct sources returned."}`;
 
         end();
         return {
@@ -837,8 +939,8 @@ async function handleToolCall(request: any) {
       case "grok_x_search": {
         // Dedicated X search - forces include_x_search
         const xSearchSchema = z.object({
-          query: z.string(),
-          max_results: z.number().int().optional(),
+          query: z.string().min(1),
+          max_results: z.number().int().min(1).max(20).optional(),
         });
         const parsedX = xSearchSchema.safeParse(safeArgs);
         if (!parsedX.success) {
@@ -856,20 +958,24 @@ async function handleToolCall(request: any) {
         const xFormatted = xSearchResults.results
           .map(
             (result: any, index: number) =>
-              `${index + 1}. [${result.title}](${result.url})\n${result.snippet}${
+              `${index + 1}. ${result.url ? `[${result.title}](${result.url})` : result.title}\n${result.snippet}${
                 result.published_date ? `\nPublished: ${result.published_date}` : ""
               }`,
           )
           .join("\n\n");
         const xSources = xSearchResults.results
+          .filter((r: any) => Boolean(r.url))
           .map((r: any, i: number) => `${i + 1}. [${r.title}](${r.url})`)
           .join("\n");
+        const xSummary = xSearchResults.summary
+          ? `\nSummary:\n${xSearchResults.summary}\n`
+          : "";
         end();
         return {
           content: [
             {
               type: "text",
-              text: `X Search Results for "${xQuery}" (${xSearchResults.total_results} results in ${xSearchResults.search_time}s):\n\n${xFormatted}\n\nSources:\n${xSources || "No sources."}`,
+              text: `X Search Results for "${xQuery}" (${xSearchResults.total_results} results in ${xSearchResults.search_time}s)\nStatus: ${xSearchResults.degraded ? "DEGRADED: live-search providers exceeded the request budget; showing a retry link." : "OK"}\n${xSummary}\n${xFormatted}\n\nSources:\n${xSources || "No sources."}`,
             },
           ],
         };
@@ -884,7 +990,10 @@ async function handleToolCall(request: any) {
         end();
         return {
           content: [
-            { type: "text", text: "OK: Grok MCP Server healthy" },
+            {
+              type: "text",
+              text: `OK: Grok MCP Server process healthy\n${JSON.stringify(grokClient.getRuntimeStatus())}`,
+            },
             { type: "text", text: metricsText },
           ],
         };
@@ -905,11 +1014,12 @@ async function handleToolCall(request: any) {
         const isConnected = await grokClient.testConnection();
         end();
         return {
+          isError: !isConnected,
           content: [
             {
               type: "text",
               text: isConnected
-                ? "✅ Grok API connection successful! Ready to use Grok 4.5."
+                ? `✅ Grok API connection successful! Ready to use ${grokConfig.model}.`
                 : "❌ Grok API connection failed. Please check your API key and configuration.",
             },
           ],
@@ -918,6 +1028,7 @@ async function handleToolCall(request: any) {
       default:
         end();
         return {
+          isError: true,
           content: [
             {
               type: "text",
@@ -940,13 +1051,16 @@ server.setRequestHandler(CallToolRequestSchema, handleToolCall);
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  logger.info("🎯 Grok 4.5 MCP Server running and ready!");
+  logger.info(
+    { model: grokConfig.model, searchModel: grokConfig.searchModel },
+    "Grok MCP Server running and ready!",
+  );
 }
 
 // Start the server only if this file is run directly
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((error) => {
-    logger.error({ err: error }, "Failed to start server");
+    logger.error({ error: toSafeError(error) }, "Failed to start server");
     process.exit(1);
   });
 }

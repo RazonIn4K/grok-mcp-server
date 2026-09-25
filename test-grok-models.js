@@ -6,7 +6,7 @@ process.env.XAI_API_KEY = 'dummy-key-for-testing';
 process.env.SHARED_SECRET = 'dummy-secret-for-testing';
 process.env.LOG_LEVEL = 'silent'; // Suppress logs
 
-console.log('🧪 Starting Grok 4.5 Model Support Tests...');
+console.log('🧪 Starting Current Grok Model Support Tests...');
 
 // Mock Transport
 class MockTransport {
@@ -40,7 +40,7 @@ async function runTests() {
         
         // Mock GrokClient methods
         grokClient.getModels = async () => {
-            return ['grok-4.5', 'grok-4.5-latest', 'grok-build-latest', 'grok-4.3', 'grok-latest', 'grok-4.20', 'grok-build-0.1', 'grok-imagine-image', 'grok-imagine-image-quality', 'grok-imagine-video', 'grok-voice-think-fast-1.0'];
+            return ['grok-4.7', 'grok-4.5', 'grok-4.20-0309-non-reasoning', 'grok-4.20-0309-reasoning', 'grok-4.20-multi-agent-0309', 'grok-4.3', 'grok-build-0.1', 'grok-imagine-image', 'grok-imagine-image-quality', 'grok-imagine-video', 'grok-imagine-video-1.5'];
         };
         
         grokClient.ask = async (question, context, systemPrompt, options) => {
@@ -92,12 +92,12 @@ async function runTests() {
         assert(!modelsResponse.error, `grok_models returned error: ${JSON.stringify(modelsResponse.error)}`);
         
         const content = modelsResponse.result.content[0].text;
-        assert(content.includes('grok-4.5'), 'Response missing expected model grok-4.5');
+        assert(content.includes('grok-4.7'), 'Response missing current default Grok model');
         console.log('✅ grok_models returned expected models');
 
         // Test 3: Call grok_ask with specific model
         console.log('\n📝 Test 3: Calling grok_ask with specific model...');
-        const testModel = 'grok-4.5';
+        const testModel = 'grok-4.7';
         transport.receive({
             jsonrpc: '2.0',
             id: 3,

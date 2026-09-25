@@ -11,6 +11,39 @@ import { LRUCache } from "lru-cache";
 import Bottleneck from "bottleneck";
 import Agent from "agentkeepalive";
 import pino from "pino";
+import { redactSecrets, toSafeError } from "./safe-error.js";
+import {
+  buildSearchResults,
+  supportsResponsesReasoning,
+} from "./search-results.js";
+
+const MAX_ATTEMPT_TIMEOUT_MS = 45000;
+const MAX_OVERALL_TIMEOUT_MS = 90000;
+const MAX_RETRIES = 1;
+export const DEFAULT_GROK_MODEL = "grok-4.7";
+export const DEFAULT_GROK_SEARCH_MODEL = "grok-4.7";
+
+const FALLBACK_GROK_MODELS = [
+  "grok-4.7",
+  "grok-4.6",
+  "grok-4.5",
+  "grok-4.20-0309-non-reasoning",
+  "grok-4.20-0309-reasoning",
+  "grok-4.20-multi-agent-0309",
+  "grok-4.3",
+  "grok-build-0.1",
+  "grok-imagine-image",
+  "grok-imagine-image-2.0",
+  "grok-imagine-image-quality",
+  "grok-imagine-video",
+  "grok-imagine-video-1.5",
+];
+
+function clampInteger(value: number, minimum: number, maximum: number): number {
+  const finiteValue = Number.isFinite(value) ? value : minimum;
+  return Math.min(maximum, Math.max(minimum, Math.floor(finiteValue)));
+}
+
 const PERPLEXITY_MODEL_LIMITS: Record<string, number> = {
   "sonar-deep-research": 5,
   "sonar-reasoning-pro": 50,
@@ -21,6 +54,21 @@ const PERPLEXITY_MODEL_LIMITS: Record<string, number> = {
 };
 const logger = pino({
   level: process.env.LOG_LEVEL || "info",
+  redact: {
+    paths: [
+      "apiKey",
+      "*.apiKey",
+      "headers.Authorization",
+      "headers.authorization",
+      "config.headers.Authorization",
+      "config.headers.authorization",
+      "err.config.headers.Authorization",
+      "err.config.headers.authorization",
+      "err.request._options.headers.Authorization",
+      "err.request._options.headers.authorization",
+    ],
+    censor: "[REDACTED]",
+  },
   transport:
     process.env.NODE_ENV !== "production"
       ? {
@@ -30,7 +78,14 @@ const logger = pino({
             destination: 2, // stderr instead of stdout
           },
         }
-      : undefined,
+      : {
+          // MCP reserves stdout for JSON-RPC. Provider/cache logs must stay on
+          // stderr in production just like the server-level logger.
+          target: "pino/file",
+          options: {
+            destination: 2,
+          },
+        },
 });
 
 export class GrokClient {
@@ -41,15 +96,64 @@ export class GrokClient {
   private limiter: Bottleneck;
   private perplexityLimiters: Map<string, Bottleneck>;
 
+  getRuntimeStatus() {
+    const counts = this.limiter.counts();
+    return {
+      model: this.config.model,
+      search_model: this.config.searchModel ?? DEFAULT_GROK_SEARCH_MODEL,
+      timeout_ms: this.config.timeoutMs ?? 45000,
+      ask_overall_timeout_ms: this.config.askOverallTimeoutMs ?? 90000,
+      retries: this.config.retries ?? 1,
+      search_timeout_ms: this.config.searchTimeoutMs ?? 45000,
+      search_overall_timeout_ms:
+        this.config.searchOverallTimeoutMs ?? 90000,
+      search_retries: this.config.searchRetries ?? 0,
+      cache_entries: this.cache.size,
+      limiter: {
+        running: counts.RUNNING,
+        queued: counts.QUEUED,
+      },
+    };
+  }
+
   constructor(config: GrokConfig) {
-    this.config = config;
+    this.config = {
+      ...config,
+      searchModel: config.searchModel ?? DEFAULT_GROK_SEARCH_MODEL,
+      timeoutMs: clampInteger(
+        config.timeoutMs ?? MAX_ATTEMPT_TIMEOUT_MS,
+        1,
+        MAX_ATTEMPT_TIMEOUT_MS,
+      ),
+      askOverallTimeoutMs: clampInteger(
+        config.askOverallTimeoutMs ?? MAX_OVERALL_TIMEOUT_MS,
+        1,
+        MAX_OVERALL_TIMEOUT_MS,
+      ),
+      searchTimeoutMs: clampInteger(
+        config.searchTimeoutMs ?? MAX_ATTEMPT_TIMEOUT_MS,
+        1,
+        MAX_ATTEMPT_TIMEOUT_MS,
+      ),
+      searchOverallTimeoutMs: clampInteger(
+        config.searchOverallTimeoutMs ?? MAX_OVERALL_TIMEOUT_MS,
+        1,
+        MAX_OVERALL_TIMEOUT_MS,
+      ),
+      retries: clampInteger(config.retries ?? MAX_RETRIES, 0, MAX_RETRIES),
+      searchRetries: clampInteger(
+        config.searchRetries ?? 0,
+        0,
+        MAX_RETRIES,
+      ),
+    };
     this.cache = new LRUCache({ max: 100, ttl: 1000 * 60 * 5 }); // 5 min cache
     this.limiter = new Bottleneck({
       maxConcurrent: config.maxConcurrent ?? 2,
       minTime: config.minTimeMs ?? 500,
     });
     this.perplexityLimiters = new Map();
-    const timeoutMs = config.timeoutMs ?? 60000;
+    const timeoutMs = this.config.timeoutMs ?? MAX_ATTEMPT_TIMEOUT_MS;
     this.client = axios.create({
       baseURL: config.baseUrl,
       headers: {
@@ -68,21 +172,57 @@ export class GrokClient {
           Authorization: `Bearer ${config.perplexityApiKey}`,
           "Content-Type": "application/json",
         },
-        timeout: config.searchTimeoutMs ?? 30000,
+        timeout: this.config.searchTimeoutMs ?? MAX_ATTEMPT_TIMEOUT_MS,
       });
     }
   }
 
   /**
-   * Send a chat completion request to Grok 4.5 or another configured text model.
+   * Send a chat completion request to Grok 4.7 or another configured text model.
    */
   async chatCompletion(
     request: Partial<GrokChatRequest>,
+    execution?: {
+      timeoutMs?: number;
+      overallTimeoutMs?: number;
+      retries?: number;
+      bypassCache?: boolean;
+    },
   ): Promise<GrokChatResponse> {
+    const startedAt = Date.now();
+    const executionTimeoutMs =
+      execution?.timeoutMs === undefined
+        ? undefined
+        : clampInteger(
+            execution.timeoutMs,
+            1,
+            this.config.timeoutMs ?? MAX_ATTEMPT_TIMEOUT_MS,
+          );
+    // Callers pass their remaining budget here (including connection probes).
+    // Queueing and retries must consume that same budget, not reset it.
+    const overallTimeoutMs = clampInteger(
+      execution?.overallTimeoutMs ?? executionTimeoutMs ??
+        this.config.askOverallTimeoutMs ?? MAX_OVERALL_TIMEOUT_MS,
+      1,
+      this.config.askOverallTimeoutMs ?? MAX_OVERALL_TIMEOUT_MS,
+    );
+    const remainingMs = () =>
+      Math.max(0, overallTimeoutMs - (Date.now() - startedAt));
+    const executionRetries =
+      execution?.retries === undefined
+        ? undefined
+        : clampInteger(
+            execution.retries,
+            0,
+            this.config.retries ?? MAX_RETRIES,
+          );
     const cacheKey = JSON.stringify({ type: "chat", ...request });
-    const cached = this.cache.get(cacheKey);
+    const cached = execution?.bypassCache ? undefined : this.cache.get(cacheKey);
     if (cached) {
-      logger.info({ cacheKey }, "Cache hit for chatCompletion");
+      logger.info(
+        { cacheKeyLength: cacheKey.length, messageCount: request.messages?.length ?? 0 },
+        "Cache hit for chatCompletion",
+      );
       return cached;
     }
     // Build request with only supported parameters for xAI API
@@ -105,7 +245,19 @@ export class GrokClient {
     } else if (this.config.maxTokens !== undefined) {
       fullRequest.max_tokens = this.config.maxTokens;
     }
-    if (request.reasoning_effort !== undefined) {
+    // Grok 4.20 selects reasoning behavior in the model slug and rejects the
+    // Chat Completions reasoning_effort field. Grok 4.5/4.6/4.7 accept
+    // low/medium/high (4.6/4.7 also accept xhigh) but cannot disable reasoning.
+    const isGrok420 = fullRequest.model.startsWith("grok-4.20");
+    const rejectsNoneReasoning =
+      fullRequest.model.startsWith("grok-4.5") ||
+      fullRequest.model.startsWith("grok-4.6") ||
+      fullRequest.model.startsWith("grok-4.7");
+    if (
+      request.reasoning_effort !== undefined &&
+      !isGrok420 &&
+      !(rejectsNoneReasoning && request.reasoning_effort === "none")
+    ) {
       fullRequest.reasoning_effort = request.reasoning_effort;
     }
 
@@ -124,18 +276,39 @@ export class GrokClient {
 
     try {
       const response: AxiosResponse<GrokChatResponse> =
-        await this.limiter.schedule(() =>
-          this.withRetries(
-            () => this.client.post("/chat/completions", fullRequest),
-            "chatCompletion",
+        await this.withDeadline(
+          this.limiter.schedule(() =>
+            this.withRetries(
+              () => {
+                const budgetMs = remainingMs();
+                if (budgetMs <= 0) {
+                  throw new Error("Chat deadline exhausted before xAI request");
+                }
+                const timeoutMs = Math.min(
+                  executionTimeoutMs ?? this.config.timeoutMs ?? MAX_ATTEMPT_TIMEOUT_MS,
+                  budgetMs,
+                );
+                return executionTimeoutMs !== undefined ||
+                  timeoutMs < (this.config.timeoutMs ?? MAX_ATTEMPT_TIMEOUT_MS)
+                  ? this.client.post("/chat/completions", fullRequest, { timeout: timeoutMs })
+                  : this.client.post("/chat/completions", fullRequest);
+              },
+              "chatCompletion",
+              executionRetries,
+              remainingMs,
+            ),
           ),
+          remainingMs(),
+          "Chat",
         );
-      this.cache.set(cacheKey, response.data);
+      if (!execution?.bypassCache) {
+        this.cache.set(cacheKey, response.data);
+      }
       return response.data;
     } catch (error) {
       logger.error(
         {
-          err: error,
+          error: toSafeError(error),
           request: {
             model: fullRequest.model,
             messageCount: fullRequest.messages?.length,
@@ -147,17 +320,17 @@ export class GrokClient {
       if (axios.isAxiosError(error)) {
         const errorData = error.response?.data;
         const isTimeout = error.code === "ECONNABORTED" || error.code === "ETIMEDOUT";
-        const errorMessage = isTimeout
-          ? `Request timed out after ${this.config.timeoutMs ?? 60000}ms. Consider increasing GROK_TIMEOUT_MS.`
+        const rawErrorMessage = isTimeout
+          ? `Request timed out after ${executionTimeoutMs ?? this.config.timeoutMs ?? MAX_ATTEMPT_TIMEOUT_MS}ms.`
           : (errorData?.error?.message ||
              errorData?.error ||
              errorData?.message ||
              error.message);
+        const errorMessage = redactSecrets(String(rawErrorMessage));
         logger.error(
           {
             status: error.response?.status,
             code: error.code,
-            errorData,
             errorMessage,
           },
           "Detailed Grok API error",
@@ -173,18 +346,27 @@ export class GrokClient {
   /**
    * Perform a live search using Grok's Responses API web_search tool.
    */
-  async liveSearch(request: GrokSearchRequest): Promise<GrokSearchResponse> {
+  async liveSearch(
+    request: GrokSearchRequest,
+    overallTimeoutMs = this.config.searchOverallTimeoutMs ?? 90000,
+  ): Promise<GrokSearchResponse> {
+    const effectiveOverallTimeoutMs = clampInteger(
+      overallTimeoutMs,
+      1,
+      this.config.searchOverallTimeoutMs ?? MAX_OVERALL_TIMEOUT_MS,
+    );
+    const startedAt = Date.now();
     const cacheKey = JSON.stringify({ type: "search", ...request });
     const cached = this.cache.get(cacheKey);
     if (cached) {
-      logger.info({ cacheKey }, "Cache hit for liveSearch");
+      logger.info(
+        { cacheKeyLength: cacheKey.length, queryLength: request.query.length },
+        "Cache hit for liveSearch",
+      );
       return cached;
     }
     try {
-      // Prefer the current flagship reasoning model unless caller selects another
-      const searchModel = this.config.model.includes("grok-4")
-        ? this.config.model
-        : "grok-4.5";
+      const searchModel = this.config.searchModel ?? DEFAULT_GROK_SEARCH_MODEL;
 
       const {
         normalizedMaxResults,
@@ -220,7 +402,7 @@ export class GrokClient {
         tools.push(webTool);
       }
 
-      const responsePayload = {
+      const responsePayload: Record<string, unknown> = {
         model: searchModel,
         input: [
           {
@@ -234,199 +416,185 @@ export class GrokClient {
           },
         ],
         tools,
-        max_output_tokens: 1200,
+        max_output_tokens: 2000,
         temperature: 0.1,
       };
+      if (supportsResponsesReasoning(searchModel)) {
+        // Keep live search fast; current Grok models default to high reasoning.
+        responsePayload.reasoning = { effort: "low" };
+      }
 
       logger.info(
-        { model: responsePayload.model, query: request.query },
+        { model: responsePayload.model, queryLength: request.query.length },
         "Executing live search request",
       );
 
-      const searchTimeoutMs = this.config.searchTimeoutMs ?? this.config.timeoutMs ?? 120000;
-      const response: AxiosResponse = await this.limiter.schedule(() =>
-        this.withRetries(
-          () =>
-            this.client.post("/responses", responsePayload, {
-              timeout: searchTimeoutMs,
-            }),
-          "liveSearch",
+      const searchTimeoutMs =
+        this.config.searchTimeoutMs ?? this.config.timeoutMs ?? 45000;
+      const response: AxiosResponse = await this.withDeadline(
+        this.limiter.schedule(() =>
+          this.withRetries(
+            () => {
+              const remainingMs = this.remainingSearchBudgetMs(
+                startedAt,
+                effectiveOverallTimeoutMs,
+              );
+              if (remainingMs <= 0) {
+                throw new Error("Search deadline exhausted before xAI request");
+              }
+              return this.client.post("/responses", responsePayload, {
+                timeout: Math.min(searchTimeoutMs, remainingMs),
+              });
+            },
+            "liveSearch",
+            this.config.searchRetries ?? 0,
+            () =>
+              this.remainingSearchBudgetMs(
+                startedAt,
+                effectiveOverallTimeoutMs,
+              ),
+          ),
         ),
+        this.remainingSearchBudgetMs(startedAt, effectiveOverallTimeoutMs),
+        "Search",
       );
 
-      const output = Array.isArray(response.data?.output)
-        ? response.data.output
-        : [];
-      const extractedContentParts: string[] = [];
-      const citations: any[] = [];
+      const { summary, results } = buildSearchResults(
+        response.data,
+        request.query,
+        normalizedMaxResults,
+      );
 
-      const appendCitations = (items: any[]) => {
-        for (const c of items || []) {
-          if (c) citations.push(c);
-        }
-      };
-
-      for (const outputItem of output) {
-        if (Array.isArray(outputItem?.citations)) {
-          appendCitations(outputItem.citations);
-        }
-
-        if (!Array.isArray(outputItem?.content)) {
-          continue;
-        }
-
-        for (const part of outputItem.content) {
-          if (typeof part === "string") {
-            extractedContentParts.push(part);
-            continue;
-          }
-
-          if (part?.type === "output_text" && typeof part.text === "string") {
-            extractedContentParts.push(part.text);
-          } else if (typeof part?.content === "string") {
-            extractedContentParts.push(part.content);
-          }
-
-          if (Array.isArray(part?.citations)) {
-            appendCitations(part.citations);
-          }
-          if (Array.isArray(part?.metadata?.citations)) {
-            appendCitations(part.metadata.citations);
-          }
-
-          // Modern Responses API annotations for inline citations / sources
-          if (Array.isArray(part?.annotations)) {
-            for (const ann of part.annotations) {
-              if (ann && (ann.url || ann.data?.url)) {
-                appendCitations([ann]);
-              }
-            }
-          }
-        }
-      }
-
-      const content = extractedContentParts
-        .filter(Boolean)
-        .map((entry) => String(entry).trim())
-        .filter(Boolean)
-        .join("\n\n");
-
-      if (Array.isArray(response.data?.citations)) {
-        appendCitations(response.data.citations);
-      }
-
-      // Also collect from top-level annotations if present (structured citations)
-      if (Array.isArray(response.data?.annotations)) {
-        appendCitations(response.data.annotations);
-      }
-
-      const normalizedCitations = citations.filter(Boolean);
-
-      // Build search results from citations
-      const results: Array<{
-        title: string;
-        url: string;
-        snippet: string;
-        published_date?: string;
-        source?: string;
-      }> = [];
-
-      const contentSnippet =
-        content.length > 0
-          ? content.substring(0, 200) + (content.length > 200 ? "..." : "")
-          : "";
-
-      if (normalizedCitations.length > 0) {
-        // Use actual citations from the API response
-        for (const citation of normalizedCitations) {
-          if (typeof citation === "string") {
-            results.push({
-              title: citation,
-              url: citation,
-              snippet: contentSnippet,
-            });
-            continue;
-          }
-
-          results.push({
-            title: citation.title || citation.url || "Search Result",
-            url: citation.url || citation.link || "",
-            snippet: citation.snippet || citation.text || contentSnippet,
-            published_date: citation.published_date,
-            source: citation.source,
-          });
-        }
-      } else {
-        // Parse results from the content if no citations returned
-        // Add the full response as a single result
-        results.push({
-          title: `Search results for: ${request.query}`,
-          url: `https://x.ai/search?q=${encodeURIComponent(request.query)}`,
-          snippet:
-            content.substring(0, 500) + (content.length > 500 ? "..." : ""),
-        });
-      }
-
-      // If Grok returns no usable results, try Perplexity fallback when configured
+      // A successful pure-X request with no matches is a valid empty result, not
+      // a web-search failure and not a synthetic source.
       if (results.length === 0) {
+        if (request.search_web === false) {
+          const emptyResponse: GrokSearchResponse = {
+            results: [],
+            total_results: 0,
+            search_time: this.elapsedSeconds(startedAt),
+            summary,
+          };
+          this.cache.set(cacheKey, emptyResponse, { ttl: 30000 });
+          return emptyResponse;
+        }
         logger.warn(
-          { query: request.query },
+          { queryLength: request.query.length },
           "No search results from Grok, attempting Perplexity fallback",
         );
-        if (this.perplexityClient) {
-          const perplexityResults = await this.perplexitySearch(request);
-          this.cache.set(cacheKey, perplexityResults);
-          return perplexityResults;
-        }
-        const simulated = await this.simulateSearch(request);
-        this.cache.set(cacheKey, simulated);
-        return simulated;
+        return this.fallbackSearch(
+          request,
+          cacheKey,
+          startedAt,
+          effectiveOverallTimeoutMs,
+        );
       }
 
       const searchResponse: GrokSearchResponse = {
-        results: results.slice(0, normalizedMaxResults),
+        results,
         total_results: results.length,
-        search_time: 0.5,
+        search_time: this.elapsedSeconds(startedAt),
+        summary,
       };
 
       this.cache.set(cacheKey, searchResponse);
       return searchResponse;
     } catch (error) {
-      logger.error({ err: error }, "Grok API liveSearch error");
+      logger.error(
+        { error: toSafeError(error) },
+        "Grok API liveSearch error",
+      );
       if (axios.isAxiosError(error)) {
         const errorData = error.response?.data;
-        const errorMessage =
+        const rawErrorMessage =
           errorData?.error?.message ||
           errorData?.error ||
           errorData?.message ||
           error.message;
+        const errorMessage = redactSecrets(String(rawErrorMessage));
         logger.warn(
           {
             status: error.response?.status,
             errorMessage,
-            errorData,
           },
           "Live search via Responses API failed, using fallback",
         );
-        // Try Perplexity first if available
-        if (this.perplexityClient) {
-          try {
-            const perplexityResults = await this.perplexitySearch(request);
-            this.cache.set(cacheKey, perplexityResults);
-            return perplexityResults;
-          } catch (perplexityError) {
-            logger.warn(
-              { err: perplexityError },
-              "Perplexity fallback failed, using simulated search",
-            );
-          }
-        }
-        const simulated = await this.simulateSearch(request);
-        this.cache.set(cacheKey, simulated);
-        return simulated;
       }
-      throw error;
+      return this.fallbackSearch(
+        request,
+        cacheKey,
+        startedAt,
+        effectiveOverallTimeoutMs,
+      );
     }
+  }
+
+  private elapsedSeconds(startedAt: number): number {
+    return Number(((Date.now() - startedAt) / 1000).toFixed(3));
+  }
+
+  private remainingSearchBudgetMs(
+    startedAt: number,
+    overallTimeoutMs: number,
+  ): number {
+    return Math.max(0, overallTimeoutMs - (Date.now() - startedAt));
+  }
+
+  private async fallbackSearch(
+    request: GrokSearchRequest,
+    cacheKey: string,
+    startedAt: number,
+    overallTimeoutMs: number,
+  ): Promise<GrokSearchResponse> {
+    const remainingMs = this.remainingSearchBudgetMs(
+      startedAt,
+      overallTimeoutMs,
+    );
+
+    if (
+      request.search_web !== false &&
+      this.perplexityClient &&
+      remainingMs >= 1000
+    ) {
+      try {
+        const perplexityResults = await this.perplexitySearch(
+          request,
+          Date.now() + remainingMs,
+        );
+        perplexityResults.search_time = this.elapsedSeconds(startedAt);
+        this.cache.set(cacheKey, perplexityResults);
+        return perplexityResults;
+      } catch (error) {
+        logger.warn(
+          { error: toSafeError(error) },
+          "Perplexity fallback failed or exhausted the search budget",
+        );
+      }
+    }
+
+    const isPureXSearch = request.search_web === false;
+    const fallback: GrokSearchResponse = {
+      results: [
+        {
+          title: isPureXSearch
+            ? "X search temporarily unavailable"
+            : "Live search temporarily unavailable",
+          url: isPureXSearch
+            ? `https://x.com/search?q=${encodeURIComponent(request.query)}&src=typed_query`
+            : `https://www.google.com/search?q=${encodeURIComponent(request.query)}`,
+          snippet:
+            "The configured live-search providers did not return within the request budget. Open this search link or retry shortly.",
+          source: "fallback",
+        },
+      ],
+      total_results: 1,
+      search_time: this.elapsedSeconds(startedAt),
+      degraded: true,
+    };
+
+    // Avoid a thundering herd while allowing a quick recovery on the next try.
+    this.cache.set(cacheKey, fallback, { ttl: 10000 });
+    return fallback;
   }
 
   /**
@@ -453,7 +621,7 @@ export class GrokClient {
 
     if (request.search_parameters?.mode === "off") {
       logger.info(
-        { query: request.query },
+        { queryLength: request.query.length },
         "search_parameters.mode is off; using request-level compatibility behavior for web search tool",
       );
     }
@@ -610,6 +778,7 @@ export class GrokClient {
    */
   private async perplexitySearch(
     request: GrokSearchRequest,
+    deadlineAt: number,
   ): Promise<GrokSearchResponse> {
     if (!this.perplexityClient) {
       throw new Error("Perplexity client not configured");
@@ -642,14 +811,27 @@ export class GrokClient {
       let response: AxiosResponse | undefined;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          response = await limiter.schedule(() =>
-            this.perplexityClient!.post("/chat/completions", payload),
+          response = await this.withDeadline(
+            limiter.schedule(() => {
+              const remainingMs = deadlineAt - Date.now();
+              if (remainingMs <= 0) {
+                throw new Error("Search deadline exhausted before Perplexity request");
+              }
+              return this.perplexityClient!.post("/chat/completions", payload, {
+                timeout: remainingMs,
+              });
+            }),
+            Math.max(0, deadlineAt - Date.now()),
+            "Search",
           );
           break;
         } catch (err: any) {
           const status = err?.response?.status;
           if (status === 429 && attempt < 2) {
             const waitMs = 500 * (attempt + 1);
+            if (Date.now() + waitMs >= deadlineAt) {
+              throw err;
+            }
             logger.warn(
               { waitMs, attempt, status },
               "Perplexity rate limited, backing off",
@@ -722,10 +904,13 @@ export class GrokClient {
       return {
         results: results.slice(0, maxResults),
         total_results: results.length,
-        search_time: 0.6,
+        search_time: 0,
       };
     } catch (error) {
-      logger.error({ err: error }, "Perplexity search failed");
+      logger.error(
+        { error: toSafeError(error) },
+        "Perplexity search failed",
+      );
       throw error;
     }
   }
@@ -769,8 +954,15 @@ export class GrokClient {
   private async withRetries<T>(
     operation: () => Promise<T>,
     operationName: string,
+    maxRetriesOverride?: number,
+    remainingBudgetMs?: () => number,
   ): Promise<T> {
-    const maxRetries = this.config.retries ?? 2;
+    const configuredRetries = this.config.retries ?? MAX_RETRIES;
+    const maxRetries = clampInteger(
+      maxRetriesOverride ?? configuredRetries,
+      0,
+      configuredRetries,
+    );
     const baseDelay = this.config.retryDelayMs ?? 1000;
     let lastError: any;
 
@@ -784,19 +976,17 @@ export class GrokClient {
           throw error;
         }
         const waitMs = baseDelay * 2 ** attempt;
+        const remainingMs = remainingBudgetMs?.();
+        if (remainingMs !== undefined && remainingMs <= waitMs) {
+          throw error;
+        }
         logger.warn(
           {
             attempt: attempt + 1,
             maxRetries,
             operation: operationName,
             waitMs,
-            error: axios.isAxiosError(error)
-              ? {
-                  code: error.code,
-                  status: error.response?.status,
-                  message: error.message,
-                }
-              : (error as Error)?.message,
+            error: toSafeError(error),
           },
           `${operationName} failed, retrying`,
         );
@@ -807,94 +997,27 @@ export class GrokClient {
     throw lastError;
   }
 
-  /**
-   * Simulate search using chat completion when live search is unavailable
-   */
-  private async simulateSearch(
-    request: GrokSearchRequest,
-  ): Promise<GrokSearchResponse> {
-    const maxResults = this.resolveSearchMaxResults(
-      request.search_parameters,
-      request.max_results,
-    );
-    const searchPrompt = `I need you to simulate web search results for the query: "${request.query}"
-
-Please provide ${maxResults} realistic search results that someone would find when searching for this topic online.
-
-Respond with ONLY valid JSON in this exact format:
-{
-  "results": [
-    {
-      "title": "Title of the webpage",
-      "url": "https://example.com/page",
-      "snippet": "Brief description of what this page contains",
-      "published_date": "2024-01-01" (optional)
-    }
-  ]
-}
-
-Make sure:
-- URLs are realistic and related to the topic
-- Snippets are informative and relevant
-- No extra text outside the JSON
-- Each result has title, url, and snippet`;
-
-    const chatResponse = await this.chatCompletion({
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a search results generator. Respond ONLY with valid JSON. Do not include any explanation or additional text.",
-        },
-        { role: "user", content: searchPrompt },
-      ],
-      temperature: 0.1, // Lower temperature for more consistent JSON
-      max_tokens: 2000,
-    });
-
+  // A provider timeout starts only after a limiter runs the request. This also
+  // bounds time spent waiting for a slot; each scheduled job checks its budget
+  // before making a provider call so expired queued jobs cannot run later.
+  private async withDeadline<T>(
+    operation: Promise<T>,
+    timeoutMs: number,
+    label: string,
+  ): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      let content =
-        chatResponse.choices[0]?.message?.content || '{"results": []}';
-
-      // Clean up the content to extract JSON
-      content = content.trim();
-
-      // Remove markdown code blocks if present
-      content = content.replace(/```json\n?|```\n?/g, "");
-
-      // Try to find JSON in the response
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        content = jsonMatch[0];
-      }
-
-      const parsed = JSON.parse(content);
-
-      return {
-        results: parsed.results || [],
-        total_results: parsed.results?.length || 0,
-        search_time: 0.5,
-      };
-    } catch (parseError) {
-      logger.error(
-        { err: parseError, content: chatResponse.choices[0]?.message?.content },
-        "Failed to parse search results",
-      );
-
-      // Return fallback results based on the query
-      const fallbackResults = [
-        {
-          title: `Search results for: ${request.query}`,
-          url: `https://www.google.com/search?q=${encodeURIComponent(request.query)}`,
-          snippet: `Information about ${request.query} - simulated search result as the live search API is not available.`,
-        },
-      ];
-
-      return {
-        results: fallbackResults,
-        total_results: fallbackResults.length,
-        search_time: 0.5,
-      };
+      return await Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`${label} deadline exhausted after ${timeoutMs}ms`)),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -914,9 +1037,11 @@ Make sure:
       enable_image_search?: boolean;
       include_x_search?: boolean;
       model?: string;
-      reasoningEffort?: "none" | "low" | "medium" | "high";
+      reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
     },
   ): Promise<string> {
+    const startedAt = Date.now();
+    const overallTimeoutMs = this.config.askOverallTimeoutMs ?? 90000;
     const messages = [];
 
     if (systemPrompt) {
@@ -935,14 +1060,28 @@ Make sure:
     // If search is requested, add recent information
     if (options?.includeSearch) {
       try {
-        const searchResults = await this.liveSearch({
-          query: question,
-          max_results: 3,
-          enable_image_understanding: options?.enable_image_understanding,
-          enable_image_search: options?.enable_image_search,
-          include_x_search: options?.include_x_search,
-        });
-        if (searchResults.results.length > 0) {
+        const remainingBeforeSearchMs = Math.max(
+          0,
+          overallTimeoutMs - (Date.now() - startedAt),
+        );
+        const searchBudgetMs = Math.min(
+          this.config.searchOverallTimeoutMs ?? 90000,
+          Math.floor(remainingBeforeSearchMs / 2),
+        );
+        if (searchBudgetMs <= 0) {
+          throw new Error("Ask deadline has no remaining search budget");
+        }
+        const searchResults = await this.liveSearch(
+          {
+            query: question,
+            max_results: 3,
+            enable_image_understanding: options?.enable_image_understanding,
+            enable_image_search: options?.enable_image_search,
+            include_x_search: options?.include_x_search,
+          },
+          searchBudgetMs,
+        );
+        if (!searchResults.degraded && searchResults.results.length > 0) {
           const searchContext = searchResults.results
             .map(
               (result, idx) =>
@@ -957,19 +1096,33 @@ Make sure:
         }
       } catch (searchError) {
         logger.warn(
-          { err: searchError },
+          { error: toSafeError(searchError) },
           "Search failed, proceeding without search context",
         );
       }
     }
 
-    const response = await this.chatCompletion({
-      messages,
-      model: options?.model,
-      temperature: options?.temperature,
-      max_tokens: options?.maxTokens,
-      reasoning_effort: options?.reasoningEffort,
-    });
+    const remainingMs = Math.max(
+      0,
+      overallTimeoutMs - (Date.now() - startedAt),
+    );
+    if (remainingMs <= 0) {
+      throw new Error("Ask deadline exhausted before chat request");
+    }
+    const response = await this.chatCompletion(
+      {
+        messages,
+        model: options?.model,
+        temperature: options?.temperature,
+        max_tokens: options?.maxTokens,
+        reasoning_effort: options?.reasoningEffort,
+      },
+      {
+        timeoutMs: Math.min(this.config.timeoutMs ?? 45000, remainingMs),
+        overallTimeoutMs: remainingMs,
+        retries: options?.includeSearch ? 0 : undefined,
+      },
+    );
 
     return response.choices[0]?.message?.content || "No response generated";
   }
@@ -979,13 +1132,24 @@ Make sure:
    */
   async testConnection(): Promise<boolean> {
     try {
-      await this.chatCompletion({
-        messages: [{ role: "user", content: "Hello, are you working?" }],
-        max_tokens: 10,
-      });
-      return true;
+      const response = await this.chatCompletion(
+        {
+          messages: [{ role: "user", content: "Reply with OK" }],
+          max_tokens: 256,
+          reasoning_effort: "low",
+        },
+        {
+          timeoutMs: Math.min(this.config.timeoutMs ?? 45000, 15000),
+          retries: 0,
+          bypassCache: true,
+        },
+      );
+      return Boolean(response.choices?.[0]?.message?.content?.trim());
     } catch (error) {
-      logger.error({ err: error }, "Grok connection test failed");
+      logger.error(
+        { error: toSafeError(error) },
+        "Grok connection test failed",
+      );
       return false;
     }
   }
@@ -995,26 +1159,17 @@ Make sure:
    */
   async getModels(): Promise<string[]> {
     try {
-      const response = await this.client.get("/models");
-      return response.data.data?.map((model: any) => model.id) || ["grok-4.5"];
+      const response = await this.client.get("/models", { timeout: 10000 });
+      const models = response.data.data
+        ?.map((model: any) => model.id)
+        .filter((model: unknown): model is string => typeof model === "string");
+      return models?.length ? models : [...FALLBACK_GROK_MODELS];
     } catch (error) {
       logger.warn(
-        { err: error },
+        { error: toSafeError(error) },
         "Models endpoint not available, using default models",
       );
-      return [
-        "grok-4.5",
-        "grok-4.5-latest",
-        "grok-build-latest",
-        "grok-4.3",
-        "grok-latest",
-        "grok-4.20",
-        "grok-build-0.1",
-        "grok-imagine-image",
-        "grok-imagine-image-quality",
-        "grok-imagine-video",
-        "grok-voice-think-fast-1.0",
-      ];
+      return [...FALLBACK_GROK_MODELS];
     }
   }
 }
