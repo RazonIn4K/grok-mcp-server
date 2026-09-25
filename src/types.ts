@@ -23,7 +23,7 @@ export interface GrokChatRequest {
   messages: GrokMessage[];
   temperature?: number;
   max_tokens?: number;
-  reasoning_effort?: "none" | "low" | "medium" | "high";
+  reasoning_effort?: "none" | "low" | "medium" | "high" | "xhigh";
   stream?: boolean;
   functions?: GrokFunction[];
   function_call?: string | { name: string };
@@ -89,12 +89,14 @@ export interface GrokSearchResponse {
   total_results: number;
   search_time: number;
   degraded?: boolean;
+  summary?: string;
 }
 
 export interface GrokConfig {
   apiKey: string;
   baseUrl: string;
   model: string;
+  searchModel?: string;
   temperature: number;
   maxTokens: number;
   perplexityApiKey?: string;

@@ -34,4 +34,48 @@ describe("safe error logging", () => {
     expect(JSON.stringify(safe)).not.toContain("should-never-appear");
     expect(JSON.stringify(safe)).not.toContain("Authorization");
   });
+
+  it("redacts credentials embedded in URLs and key-value error text", () => {
+    const message =
+      "GET https://provider.test/models?api_key=url-secret&mode=safe password=body-secret";
+
+    const safe = redactSecrets(message);
+
+    expect(safe).not.toContain("url-secret");
+    expect(safe).not.toContain("body-secret");
+    expect(safe).toContain("mode=safe");
+  });
+
+  it.each([
+    "api_key",
+    "api-key",
+    "token",
+    "access_token",
+    "access-token",
+    "secret",
+    "password",
+    "authorization",
+  ])("redacts JSON-quoted %s fields in provider error messages", (field) => {
+    const message = JSON.stringify({
+      [field]: "fake credential with spaces & an escaped \"quote\"",
+      operation: "chat",
+    });
+
+    const safe = toSafeError(new Error(message));
+
+    expect(safe.message).not.toContain("fake");
+    expect(safe.message).not.toContain("credential");
+    expect(safe.message).not.toContain("escaped");
+    expect(safe.message).not.toContain("quote");
+    expect(safe.message).toContain("[REDACTED]");
+    expect(safe.message).toContain('"operation":"chat"');
+  });
+
+  it("redacts single-quoted keys and values without exposing trailing words", () => {
+    const safe = redactSecrets("'password': 'fake secret with spaces' operation=chat");
+
+    expect(safe).not.toContain("fake");
+    expect(safe).not.toContain("spaces");
+    expect(safe).toContain("operation=chat");
+  });
 });

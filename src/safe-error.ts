@@ -1,6 +1,11 @@
 const secretPatterns = [
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
   /xai-[A-Za-z0-9_-]+/g,
+  /[?&](?:api[_-]?key|key|token|access[_-]?token|secret|password)=[^&\s"']+/gi,
+  // Provider errors may embed JSON or quoted key/value fields. Consume the
+  // entire quoted value, including spaces and escaped quotes, before falling
+  // back to an unquoted token.
+  /\b(?:api[_-]?key|token|access[_-]?token|secret|password|authorization)\b["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,"'}&]+)/gi,
 ];
 
 export function redactSecrets(value: string): string {

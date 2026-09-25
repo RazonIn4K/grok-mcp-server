@@ -143,11 +143,8 @@ if [ -z "$SHARED_SECRET" ]; then
     exit 1
 fi
 
-# Set defaults for optional vars
-export XAI_BASE_URL="${XAI_BASE_URL:-https://api.x.ai/v1}"
-export GROK_MODEL="${GROK_MODEL:-grok-4.5}"
-export GROK_TEMPERATURE="${GROK_TEMPERATURE:-0.7}"
-export GROK_MAX_TOKENS="${GROK_MAX_TOKENS:-4000}"
+# Optional model/API settings are resolved by the server from the environment,
+# then .env, then compiled defaults. Do not mask .env overrides here.
 export LOG_LEVEL="${LOG_LEVEL:-info}"
 export NODE_ENV="${NODE_ENV:-production}"
 
